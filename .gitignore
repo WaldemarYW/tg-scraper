@@ -1,0 +1,4 @@
+.env
+scraper_session.session
+__pycache__/
+*.pyc

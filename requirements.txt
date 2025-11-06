@@ -1,0 +1,6 @@
+aiogram==2.25.1
+fastapi==0.115.2
+uvicorn[standard]==0.30.6
+telethon==1.36.0
+python-dotenv==1.0.1
+requests==2.32.3
