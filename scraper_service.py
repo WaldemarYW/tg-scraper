@@ -3,11 +3,11 @@ import asyncio
 import csv
 import logging
 import os
+import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
-import re
 import re
 
 from dotenv import load_dotenv
@@ -81,6 +81,7 @@ class JobStatusResponse(BaseModel):
     finished_at: Optional[str] = None
     error: Optional[str] = None
     csv_path: Optional[str] = None
+    chat_title: Optional[str] = None
 
 
 class CSVExport(BaseModel):
@@ -196,11 +197,26 @@ def _list_csv_exports() -> List[CSVExport]:
     return exports
 
 
+def _clear_csv_exports() -> int:
+    if not os.path.isdir(CSV_OUTPUT_DIR):
+        return 0
+    removed = 0
+    for entry in os.scandir(CSV_OUTPUT_DIR):
+        if entry.is_file() and entry.name.endswith(".csv"):
+            try:
+                os.remove(entry.path)
+                removed += 1
+            except FileNotFoundError:
+                continue
+    return removed
+
+
 async def scrape_users(job_id: str, chat_value: str) -> None:
     processed_total = 0
     newly_saved = 0
     csv_path = ""
     chat_title = chat_value
+    job_members: List[Member] = []
 
     try:
         async with scrape_lock:
@@ -210,13 +226,14 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             async with db_lock:
                 existing_ids = await asyncio.to_thread(_fetch_existing_ids_sync, db_conn)
 
-            await _update_job(job_id, total=len(existing_ids), processed=0)
+            await _update_job(job_id, total=0, processed=0)
 
             entity = await client.get_entity(chat_value)
             chat_title = _derive_chat_title(entity, chat_value)
             safe_title = _safe_filename_component(chat_title) or f"job_{job_id}"
             csv_filename = f"members_{safe_title}.csv"
             csv_path = os.path.join(CSV_OUTPUT_DIR, csv_filename)
+            await _update_job(job_id, chat_title=chat_title)
 
             logger.info(
                 "Starting scrape job %s for %s. Already have %d members.",
@@ -243,18 +260,6 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                     raise RuntimeError(f"Error: {e}") from e
 
                 processed_total += 1
-
-                if user.id in existing_ids:
-                    if REQUEST_INTERVAL_SECONDS > 0:
-                        await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
-                    if processed_total % CHUNK_SIZE == 0:
-                        await _update_job(
-                            job_id,
-                            processed=processed_total,
-                            total=len(existing_ids),
-                        )
-                    continue
-
                 member = Member(
                     id=user.id,
                     username=user.username,
@@ -263,6 +268,18 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                     phone=user.phone,
                     added_at=datetime.utcnow().isoformat(),
                 )
+                job_members.append(member)
+
+                if user.id in existing_ids:
+                    if REQUEST_INTERVAL_SECONDS > 0:
+                        await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
+                    if processed_total % CHUNK_SIZE == 0:
+                        await _update_job(
+                            job_id,
+                            processed=processed_total,
+                            total=len(job_members),
+                        )
+                    continue
 
                 async with db_lock:
                     await asyncio.to_thread(_insert_member_sync, db_conn, member)
@@ -278,7 +295,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                     await _update_job(
                         job_id,
                         processed=processed_total,
-                        total=len(existing_ids),
+                        total=len(job_members),
                     )
 
                 if processed_in_chunk >= CHUNK_SIZE:
@@ -290,7 +307,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                     await _update_job(
                         job_id,
                         processed=processed_total,
-                        total=len(existing_ids),
+                        total=len(job_members),
                     )
                     await asyncio.sleep(PAUSE_BETWEEN_CHUNKS)
                     processed_in_chunk = 0
@@ -305,7 +322,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             async with db_lock:
                 members = await asyncio.to_thread(_fetch_all_members_sync, db_conn)
 
-            await asyncio.to_thread(_write_members_csv, members, csv_path)
+            await asyncio.to_thread(_write_members_csv, job_members, csv_path)
 
             logger.info(
                 "Scrape finished for %s. Total unique members stored: %d (newly added %d).",
@@ -317,21 +334,20 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             await _update_job(
                 job_id,
                 status="done",
-                total=len(members),
+                total=len(job_members),
                 processed=processed_total,
                 finished_at=_current_iso(),
                 error=None,
                 csv_path=csv_path,
             )
     except Exception as exc:
-        total_snapshot = len(existing_ids) if "existing_ids" in locals() else 0
         await _update_job(
             job_id,
             status="error",
             error=str(exc),
             finished_at=_current_iso(),
             processed=processed_total,
-            total=total_snapshot,
+            total=len(job_members),
             csv_path=csv_path if os.path.exists(csv_path) else None,
         )
         logger.exception("Scrape job %s failed: %s", job_id, exc)
@@ -446,6 +462,7 @@ async def scrape(req: ScrapeRequest):
             "finished_at": None,
             "error": None,
             "csv_path": None,
+            "chat_title": None,
         }
 
     asyncio.create_task(scrape_users(job_id, chat_value))
@@ -488,6 +505,19 @@ async def scrape_export(filename: str):
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path, media_type="text/csv", filename=filename)
+
+
+@app.post("/scrape_exports/clear")
+async def scrape_exports_clear():
+    deleted = await asyncio.to_thread(_clear_csv_exports)
+
+    async with jobs_lock:
+        for job in SCRAPE_JOBS.values():
+            csv_path = job.get("csv_path")
+            if csv_path and not os.path.exists(csv_path):
+                job["csv_path"] = None
+
+    return {"deleted": deleted}
 
 
 @app.get("/scrape_result")
