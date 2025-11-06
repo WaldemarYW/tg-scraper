@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
@@ -395,3 +396,22 @@ async def scrape_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return JobStatusResponse(job_id=job_id, **job)
+
+
+@app.get("/scrape_result")
+async def scrape_result(job_id: str):
+    async with jobs_lock:
+        job = SCRAPE_JOBS.get(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.get("status") != "done":
+        raise HTTPException(status_code=409, detail="Job not finished")
+
+    csv_path = job.get("csv_path")
+    if not csv_path or not os.path.exists(csv_path):
+        raise HTTPException(status_code=500, detail="CSV file is not available")
+
+    filename = os.path.basename(csv_path)
+    return FileResponse(csv_path, media_type="text/csv", filename=filename)
