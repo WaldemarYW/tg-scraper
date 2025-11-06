@@ -279,9 +279,11 @@ async def handle_text(message: types.Message):
         csv_bytes = io.BytesIO(csv_response.content)
         csv_bytes.name = filename
 
+        processed_count = status_data.get("processed", processed)
         caption = (
             f"Готово ✅\n"
             f"Чат: `{chat_ref}`\n"
+            f"Получено записей: *{processed_count}*\n"
             f"Уникальных участников: *{total}*.\n\n"
             "Файл добавлен в общий список /exports."
         )
