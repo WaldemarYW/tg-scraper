@@ -7,6 +7,8 @@ import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
+import re
+import re
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -33,6 +35,7 @@ PAUSE_BETWEEN_CHUNKS = 1.0
 REQUEST_INTERVAL_SECONDS = 0.0
 JOB_RETENTION_SECONDS = 3600
 CSV_OUTPUT_DIR = os.getenv("CSV_OUTPUT_DIR", "exports")
+FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
@@ -141,10 +144,23 @@ def _write_members_csv(members: List[Member], csv_path: str) -> None:
             )
 
 
-def _extract_job_id_from_filename(filename: str) -> Optional[str]:
-    if filename.startswith("members_") and filename.endswith(".csv"):
-        return filename[len("members_") : -4]
-    return None
+def _safe_filename_component(value: str) -> str:
+    cleaned = FILENAME_SANITIZE_RE.sub("_", value.strip())
+    cleaned = cleaned.strip("._-")
+    return cleaned[:80]
+
+
+def _derive_chat_title(entity: Any, fallback: str) -> str:
+    for attr in ("title", "username", "first_name"):
+        val = getattr(entity, attr, None)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    if isinstance(entity, dict):
+        for key in ("title", "username", "first_name"):
+            val = entity.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+    return fallback
 
 
 def _list_csv_exports() -> List[CSVExport]:
@@ -167,7 +183,7 @@ def _list_csv_exports() -> List[CSVExport]:
 
     for entry in entries:
         file_path = os.path.abspath(entry.path)
-        job_id = job_map.get(file_path) or _extract_job_id_from_filename(entry.name)
+        job_id = job_map.get(file_path)
         created_at = datetime.utcfromtimestamp(entry.stat().st_mtime).isoformat()
         exports.append(
             CSVExport(
@@ -183,7 +199,8 @@ def _list_csv_exports() -> List[CSVExport]:
 async def scrape_users(job_id: str, chat_value: str) -> None:
     processed_total = 0
     newly_saved = 0
-    csv_path = os.path.join(CSV_OUTPUT_DIR, f"members_{job_id}.csv")
+    csv_path = ""
+    chat_title = chat_value
 
     try:
         async with scrape_lock:
@@ -195,10 +212,16 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
 
             await _update_job(job_id, total=len(existing_ids), processed=0)
 
+            entity = await client.get_entity(chat_value)
+            chat_title = _derive_chat_title(entity, chat_value)
+            safe_title = _safe_filename_component(chat_title) or f"job_{job_id}"
+            csv_filename = f"members_{safe_title}.csv"
+            csv_path = os.path.join(CSV_OUTPUT_DIR, csv_filename)
+
             logger.info(
                 "Starting scrape job %s for %s. Already have %d members.",
                 job_id,
-                chat_value,
+                chat_title,
                 len(existing_ids),
             )
 
@@ -286,7 +309,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
 
             logger.info(
                 "Scrape finished for %s. Total unique members stored: %d (newly added %d).",
-                chat_value,
+                chat_title,
                 len(members),
                 newly_saved,
             )
