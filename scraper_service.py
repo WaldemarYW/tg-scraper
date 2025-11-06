@@ -80,6 +80,13 @@ class JobStatusResponse(BaseModel):
     csv_path: Optional[str] = None
 
 
+class CSVExport(BaseModel):
+    filename: str
+    job_id: Optional[str]
+    created_at: Optional[str]
+    url: str
+
+
 def _current_iso() -> str:
     return datetime.utcnow().isoformat()
 
@@ -132,6 +139,45 @@ def _write_members_csv(members: List[Member], csv_path: str) -> None:
                     member.added_at,
                 ]
             )
+
+
+def _extract_job_id_from_filename(filename: str) -> Optional[str]:
+    if filename.startswith("members_") and filename.endswith(".csv"):
+        return filename[len("members_") : -4]
+    return None
+
+
+def _list_csv_exports() -> List[CSVExport]:
+    exports: List[CSVExport] = []
+    base_path = os.path.abspath(CSV_OUTPUT_DIR)
+
+    try:
+        entries = list(os.scandir(base_path))
+    except FileNotFoundError:
+        return exports
+
+    entries = [entry for entry in entries if entry.is_file() and entry.name.endswith(".csv")]
+    entries.sort(key=lambda e: e.stat().st_mtime, reverse=True)
+
+    job_map = {}
+    for job_id, job in SCRAPE_JOBS.items():
+        csv_path = job.get("csv_path")
+        if csv_path:
+            job_map[os.path.abspath(csv_path)] = job_id
+
+    for entry in entries:
+        file_path = os.path.abspath(entry.path)
+        job_id = job_map.get(file_path) or _extract_job_id_from_filename(entry.name)
+        created_at = datetime.utcfromtimestamp(entry.stat().st_mtime).isoformat()
+        exports.append(
+            CSVExport(
+                filename=entry.name,
+                job_id=job_id,
+                created_at=created_at,
+                url=f"/scrape_export/{entry.name}",
+            )
+        )
+    return exports
 
 
 async def scrape_users(job_id: str, chat_value: str) -> None:
@@ -396,6 +442,48 @@ async def scrape_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return JobStatusResponse(job_id=job_id, **job)
+
+
+@app.get("/scrape_exports", response_model=List[CSVExport])
+async def scrape_exports():
+    return _list_csv_exports()
+
+
+def _resolve_csv_path(filename: str) -> str:
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    abs_dir = os.path.abspath(CSV_OUTPUT_DIR)
+    abs_path = os.path.abspath(os.path.join(CSV_OUTPUT_DIR, filename))
+    if not abs_path.startswith(abs_dir + os.sep) and abs_path != abs_dir:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    return abs_path
+
+
+@app.get("/scrape_export/{filename}")
+async def scrape_export(filename: str):
+    path = _resolve_csv_path(filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(path, media_type="text/csv", filename=filename)
+
+
+@app.get("/scrape_result")
+async def scrape_result(job_id: str):
+    async with jobs_lock:
+        job = SCRAPE_JOBS.get(job_id)
+
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if job.get("status") != "done":
+        raise HTTPException(status_code=409, detail="Job not finished")
+
+    csv_path = job.get("csv_path")
+    if not csv_path or not os.path.exists(csv_path):
+        raise HTTPException(status_code=500, detail="CSV file is not available")
+
+    filename = os.path.basename(csv_path)
+    return FileResponse(csv_path, media_type="text/csv", filename=filename)
 
 
 @app.get("/scrape_result")
