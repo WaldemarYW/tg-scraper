@@ -328,5 +328,9 @@ async def handle_export_download(callback_query: types.CallbackQuery):
         types.InputFile(csv_bytes),
         caption=f"Экспорт {filename}",
     )
+
+
 if __name__ == "__main__":
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     executor.start_polling(dp, skip_updates=True)
