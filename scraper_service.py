@@ -1,5 +1,6 @@
 # scraper_service.py
 import asyncio
+import csv
 import logging
 import os
 import sqlite3
@@ -30,6 +31,7 @@ CHUNK_SIZE = 100
 PAUSE_BETWEEN_CHUNKS = 1.0
 REQUEST_INTERVAL_SECONDS = 0.0
 JOB_RETENTION_SECONDS = 3600
+CSV_OUTPUT_DIR = os.getenv("CSV_OUTPUT_DIR", "exports")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
@@ -41,6 +43,8 @@ db_lock = asyncio.Lock()
 scrape_lock = asyncio.Lock()
 SCRAPE_JOBS: Dict[str, Dict[str, Any]] = {}
 jobs_lock = asyncio.Lock()
+
+os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 
 
 app = FastAPI(title="TG Scraper API")
@@ -72,6 +76,7 @@ class JobStatusResponse(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     error: Optional[str] = None
+    csv_path: Optional[str] = None
 
 
 def _current_iso() -> str:
@@ -111,9 +116,27 @@ async def cleanup_finished_jobs() -> None:
             SCRAPE_JOBS.pop(job_id, None)
 
 
+def _write_members_csv(members: List[Member], csv_path: str) -> None:
+    with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow(["id", "username", "first_name", "last_name", "phone", "added_at"])
+        for member in members:
+            writer.writerow(
+                [
+                    member.id,
+                    member.username or "",
+                    member.first_name or "",
+                    member.last_name or "",
+                    member.phone or "",
+                    member.added_at,
+                ]
+            )
+
+
 async def scrape_users(job_id: str, chat_value: str) -> None:
     processed_total = 0
     newly_saved = 0
+    csv_path = os.path.join(CSV_OUTPUT_DIR, f"members_{job_id}.csv")
 
     try:
         async with scrape_lock:
@@ -212,6 +235,8 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             async with db_lock:
                 members = await asyncio.to_thread(_fetch_all_members_sync, db_conn)
 
+            await asyncio.to_thread(_write_members_csv, members, csv_path)
+
             logger.info(
                 "Scrape finished for %s. Total unique members stored: %d (newly added %d).",
                 chat_value,
@@ -226,6 +251,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                 processed=processed_total,
                 finished_at=_current_iso(),
                 error=None,
+                csv_path=csv_path,
             )
     except Exception as exc:
         total_snapshot = len(existing_ids) if "existing_ids" in locals() else 0
@@ -236,6 +262,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             finished_at=_current_iso(),
             processed=processed_total,
             total=total_snapshot,
+            csv_path=csv_path if os.path.exists(csv_path) else None,
         )
         logger.exception("Scrape job %s failed: %s", job_id, exc)
 
@@ -348,6 +375,7 @@ async def scrape(req: ScrapeRequest):
             "started_at": _current_iso(),
             "finished_at": None,
             "error": None,
+            "csv_path": None,
         }
 
     asyncio.create_task(scrape_users(job_id, chat_value))
