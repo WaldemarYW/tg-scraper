@@ -26,8 +26,8 @@ TARGET_DEFAULT = os.getenv("TARGET")
 DATABASE_PATH = os.getenv("DATABASE_PATH", "members.db")
 
 CHUNK_SIZE = 100
-PAUSE_BETWEEN_CHUNKS = 2
-REQUEST_INTERVAL_SECONDS = 1.0
+PAUSE_BETWEEN_CHUNKS = 1.0
+REQUEST_INTERVAL_SECONDS = 0.0
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
@@ -184,7 +184,8 @@ async def scrape(req: ScrapeRequest):
                 raise HTTPException(status_code=400, detail=f"Error: {e}") from e
 
             if user.id in existing_ids:
-                await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
+                if REQUEST_INTERVAL_SECONDS > 0:
+                    await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
                 continue
 
             member = Member(
@@ -203,7 +204,8 @@ async def scrape(req: ScrapeRequest):
             newly_saved += 1
             processed_in_chunk += 1
 
-            await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
+            if REQUEST_INTERVAL_SECONDS > 0:
+                await asyncio.sleep(REQUEST_INTERVAL_SECONDS)
 
             if processed_in_chunk >= CHUNK_SIZE:
                 logger.info(
