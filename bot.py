@@ -1,18 +1,20 @@
 # bot.py
+import asyncio
 import os
 import io
-import csv
 import logging
+import uuid
 from typing import Dict
 
 import requests
 from aiogram import Bot, Dispatcher, executor, types
+from aiogram.utils.exceptions import MessageNotModified
 from dotenv import load_dotenv
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-SCRAPER_API_URL = os.getenv("SCRAPER_API_URL", "http://127.0.0.1:8000")
+SCRAPER_API_URL = os.getenv("SCRAPER_API_URL", "http://127.0.0.1:8000").rstrip("/")
 
 logging.basicConfig(level=logging.INFO)
 
@@ -23,13 +25,37 @@ dp = Dispatcher(bot)
 user_states: Dict[int, str] = {}  # user_id -> "waiting_for_chat"
 
 
+async def api_request(method: str, endpoint: str, **kwargs):
+    timeout = kwargs.pop("timeout", 30)
+    url = f"{SCRAPER_API_URL}{endpoint}"
+
+    def _do_request():
+        return requests.request(method=method, url=url, timeout=timeout, **kwargs)
+
+    return await asyncio.to_thread(_do_request)
+
+
+async def api_json(method: str, endpoint: str, **kwargs):
+    response = await api_request(method, endpoint, **kwargs)
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    return response, data
+
+
+CALLBACK_PREFIX = "download:"
+export_tokens: Dict[str, str] = {}
+
+
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     text = (
         "Привет! 👋\n\n"
         "Я бот для скрапа участников из групп/каналов.\n\n"
         "Команды:\n"
-        "/scrape – собрать участников из группы/канала и получить CSV.\n\n"
+        "/scrape – создать новую задачу на сбор участников и получить CSV после завершения.\n"
+        "/exports – список всех готовых выгрузок.\n\n"
         "Когда нажмёшь /scrape, я попрошу ссылку или @юзернейм чата."
     )
     await message.answer(text)
@@ -47,9 +73,59 @@ async def cmd_scrape(message: types.Message):
         "`https://t.me/testgroup`\n"
         "или\n"
         "`@testgroup`\n\n"
-        "Я соберу участников (по умолчанию до 200) и пришлю CSV-файл."
+        "Я запущу задачу на сбор всех доступных участников и пришлю CSV, когда она завершится."
     )
     await message.answer(text, parse_mode="Markdown")
+
+
+@dp.message_handler(commands=["exports"])
+async def cmd_exports(message: types.Message):
+    try:
+        response, data = await api_json("get", "/scrape_exports", timeout=20)
+    except Exception as exc:
+        await message.answer(f"Не удалось получить список выгрузок: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, list):
+        await message.answer(
+            f"Ошибка от сервиса экспорта ({response.status_code}): {response.text}"
+        )
+        return
+
+    if not data:
+        await message.answer("Готовых CSV пока нет. Создай новую задачу через /scrape.")
+        return
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    buttons_added = 0
+
+    for export in data:
+        filename = export.get("filename")
+        if not filename:
+            continue
+        created_at = export.get("created_at")
+        label = filename
+        if created_at:
+            label = f"{filename} ({created_at.replace('T', ' ')[:19]})"
+
+        token = filename
+        if len(f"{CALLBACK_PREFIX}{token}") > 64:
+            token = uuid.uuid4().hex
+        export_tokens[token] = filename
+
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=label,
+                callback_data=f"{CALLBACK_PREFIX}{token}",
+            )
+        )
+        buttons_added += 1
+
+    if buttons_added == 0:
+        await message.answer("Готовых CSV пока нет. Создай новую задачу через /scrape.")
+        return
+
+    await message.answer("Выбери файл для скачивания:", reply_markup=keyboard)
 
 
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
@@ -64,68 +140,193 @@ async def handle_text(message: types.Message):
         # сбрасываем состояние
         user_states[user_id] = ""
 
-        await message.answer("Пробую скрапнуть участников, подожди немного... ⏳")
+        awaiting_msg = await message.answer("Создаю задачу на сбор участников... ⏳")
 
-        # запрос к API скрапера
         try:
-            resp = requests.post(
-                f"{SCRAPER_API_URL}/scrape",
-                json={"chat": chat_ref, "limit": 200},
-                timeout=60,
+            response, data = await api_json(
+                "post",
+                "/scrape",
+                json={"chat": chat_ref},
+                timeout=20,
             )
-        except Exception as e:
-            await message.answer(f"Не смог достучаться до API скрапера: {e}")
+        except Exception as exc:
+            await awaiting_msg.edit_text(f"Не смог достучаться до API скрапера: {exc}")
             return
 
-        if resp.status_code != 200:
-            await message.answer(
-                f"Ошибка от скрапера ({resp.status_code}): {resp.text}"
+        if response.status_code != 202 or not isinstance(data, dict):
+            await awaiting_msg.edit_text(
+                f"Ошибка от скрапера ({response.status_code}): {response.text}"
             )
             return
 
-        data = resp.json()
-        total = data.get("total", 0)
-        members = data.get("members", [])
-
-        if total == 0:
-            await message.answer("Никого не нашёл 😕 Проверь ссылку/юзернейм.")
+        job_id = data.get("job_id")
+        if not job_id:
+            await awaiting_msg.edit_text("Скрапер не вернул идентификатор задачи 😕")
             return
 
-        # создаём CSV в памяти
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(["id", "username", "first_name", "last_name"])
+        await awaiting_msg.edit_text(
+            f"Задача `{job_id}` запущена.\n"
+            f"Чат: `{chat_ref}`\n"
+            "Буду проверять прогресс и пришлю CSV, как только всё будет готово.",
+            parse_mode="Markdown",
+        )
 
-        for m in members:
-            writer.writerow(
-                [
-                    m.get("id"),
-                    m.get("username") or "",
-                    m.get("first_name") or "",
-                    m.get("last_name") or "",
-                ]
+        progress_message = await message.answer("Жду обновлений от скрапера...")
+        last_processed = -1
+        last_total = -1
+
+        status_data = None
+        while True:
+            try:
+                status_response, status_data = await api_json(
+                    "get",
+                    "/scrape_status",
+                    params={"job_id": job_id},
+                    timeout=20,
+                )
+            except Exception as exc:
+                await progress_message.edit_text(f"Ошибка при проверке статуса: {exc}")
+                return
+
+            if status_response.status_code == 404:
+                await progress_message.edit_text("Задача не найдена. Попробуй ещё раз.")
+                return
+
+            if status_response.status_code != 200 or not isinstance(status_data, dict):
+                await progress_message.edit_text(
+                    f"Скрапер вернул ошибку ({status_response.status_code}): {status_response.text}"
+                )
+                return
+
+            status = status_data.get("status")
+            processed = status_data.get("processed", 0)
+            total = status_data.get("total", 0)
+
+            if status == "running":
+                if processed != last_processed or total != last_total:
+                    progress_text = (
+                        f"Задача `{job_id}` выполняется…\n"
+                        f"Обработано записей: {processed}\n"
+                        f"Уникальных участников в базе: {total}"
+                    )
+                    try:
+                        await progress_message.edit_text(
+                            progress_text,
+                            parse_mode="Markdown",
+                        )
+                    except MessageNotModified:
+                        pass
+                    last_processed = processed
+                    last_total = total
+                await asyncio.sleep(5)
+                continue
+
+            if status == "error":
+                error_text = status_data.get("error") or "Неизвестная ошибка"
+                await progress_message.edit_text(
+                    f"Задача `{job_id}` завершилась с ошибкой:\n{error_text}",
+                    parse_mode="Markdown",
+                )
+                return
+
+            if status == "done":
+                total = status_data.get("total", total)
+                try:
+                    await progress_message.edit_text(
+                        f"Задача `{job_id}` завершилась. Формирую CSV...",
+                        parse_mode="Markdown",
+                    )
+                except MessageNotModified:
+                    pass
+                break
+
+            await progress_message.edit_text(
+                f"Неожиданный статус задачи: {status}"
             )
+            return
 
-        csv_bytes = io.BytesIO(output.getvalue().encode("utf-8"))
-        csv_bytes.name = "members.csv"
+        try:
+            csv_response = await api_request(
+                "get",
+                "/scrape_result",
+                params={"job_id": job_id},
+                timeout=120,
+            )
+        except Exception as exc:
+            await progress_message.edit_text(f"Не удалось получить CSV: {exc}")
+            return
 
-        text = (
+        if csv_response.status_code != 200:
+            await progress_message.edit_text(
+                f"Скрапер не смог отдать CSV ({csv_response.status_code}): {csv_response.text}"
+            )
+            return
+
+        filename = status_data.get("csv_path")
+        if filename:
+            filename = os.path.basename(filename)
+        else:
+            filename = f"members_{job_id}.csv"
+
+        csv_bytes = io.BytesIO(csv_response.content)
+        csv_bytes.name = filename
+
+        caption = (
             f"Готово ✅\n"
             f"Чат: `{chat_ref}`\n"
-            f"Найдено участников: *{total}*.\n\n"
-            f"Вот файл CSV:"
+            f"Уникальных участников: *{total}*.\n\n"
+            "Файл добавлен в общий список /exports."
         )
 
         await message.answer_document(
             types.InputFile(csv_bytes),
-            caption=text,
+            caption=caption,
             parse_mode="Markdown",
         )
+
+        try:
+            await progress_message.edit_text(
+                f"Задача `{job_id}` завершена, CSV отправлен ✅",
+                parse_mode="Markdown",
+            )
+        except MessageNotModified:
+            pass
 
     else:
         # если не в режиме скрапа — просто подсказываем команды
         await message.answer("Если хочешь собрать участников – нажми /scrape 🙂")
 
 
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(CALLBACK_PREFIX))
+async def handle_export_download(callback_query: types.CallbackQuery):
+    token = callback_query.data[len(CALLBACK_PREFIX) :]
+    filename = export_tokens.get(token, token)
+
+    await callback_query.answer("Готовлю файл…")
+
+    try:
+        response = await api_request(
+            "get",
+            f"/scrape_export/{filename}",
+            timeout=120,
+        )
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось скачать файл: {exc}")
+        return
+
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка при скачивании ({response.status_code}): {response.text}"
+        )
+        return
+
+    csv_bytes = io.BytesIO(response.content)
+    csv_bytes.name = filename
+
+    await bot.send_document(
+        callback_query.from_user.id,
+        types.InputFile(csv_bytes),
+        caption=f"Экспорт {filename}",
+    )
 if __name__ == "__main__":
     executor.start_polling(dp, skip_updates=True)
