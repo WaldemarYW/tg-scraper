@@ -1,5 +1,6 @@
 # scraper_login.py
 import os
+
 from dotenv import load_dotenv
 from telethon import TelegramClient
 
@@ -8,9 +9,10 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 SCRAPER_PHONE = os.getenv("SCRAPER_PHONE")
+SESSION_NAME = os.getenv("SESSION", "scraper_session")
 
-# файл сессии будет храниться как scraper_session.session
-client = TelegramClient("scraper_session", API_ID, API_HASH)
+# файл сессии будет храниться с именем SESSION_NAME (по умолчанию scraper_session.session)
+client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 
 async def main():

@@ -1,4 +1,6 @@
 .env
 scraper_session.session
+scraper_session.session-journal
+members.db
 __pycache__/
 *.pyc
