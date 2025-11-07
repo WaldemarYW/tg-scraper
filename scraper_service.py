@@ -166,6 +166,17 @@ def _derive_chat_title(entity: Any, fallback: str) -> str:
     return fallback
 
 
+def _fallback_from_chat_value(value: str) -> str:
+    if not value:
+        return ""
+    stripped = value.strip()
+    if stripped.startswith("@"):
+        stripped = stripped[1:]
+    if "/" in stripped:
+        stripped = stripped.rstrip("/").rsplit("/", 1)[-1]
+    return stripped
+
+
 def _list_csv_exports() -> List[CSVExport]:
     exports: List[CSVExport] = []
     base_path = os.path.abspath(CSV_OUTPUT_DIR)
@@ -242,7 +253,8 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
 
             entity = await client.get_entity(chat_value)
             chat_title = _derive_chat_title(entity, chat_value)
-            safe_title = _safe_filename_component(chat_title) or f"job_{job_id}"
+            fallback_name = _fallback_from_chat_value(chat_value)
+            safe_title = _safe_filename_component(chat_title) or _safe_filename_component(fallback_name) or f"job_{job_id}"
             csv_filename = f"members_{safe_title}.csv"
             csv_path = os.path.join(CSV_OUTPUT_DIR, csv_filename)
             await _update_job(job_id, chat_title=chat_title)
