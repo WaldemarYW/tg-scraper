@@ -4,7 +4,7 @@ import os
 import io
 import logging
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 import requests
 from aiogram import Bot, Dispatcher, executor, types
@@ -317,6 +317,12 @@ async def cmd_exports(message: types.Message):
         )
         return
 
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="Очистить список",
+            callback_data=CLEAR_EXPORTS_CALLBACK,
+        )
+    )
     keyboard.add(
         types.InlineKeyboardButton(
             text="Скачать всю БД CSV",
