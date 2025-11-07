@@ -211,6 +211,13 @@ async def poll_broadcast_status(
             status_text += f"\n\n{message_text}"
 
         reply_markup = keyboard if status == "running" else None
+        if status in {"done", "error", "cancelled"}:
+            reply_markup = types.InlineKeyboardMarkup().add(
+                types.InlineKeyboardButton(
+                    text="Последние 10",
+                    callback_data=f"{BROADCAST_INFO_PREFIX}{job_id}:0",
+                )
+            )
 
         try:
             await progress_message.edit_text(
