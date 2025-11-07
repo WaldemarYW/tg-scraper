@@ -50,8 +50,17 @@ CLEAR_EXPORTS_CALLBACK = "clear_exports"
 FULL_EXPORT_CALLBACK = "download_full"
 STOP_BROADCAST_PREFIX = "stop_broadcast:"
 BROADCAST_INFO_PREFIX = "broadcast_info:"
-BROADCAST_STATS_CALLBACK = "broadcast_stats"
 export_tokens: Dict[str, str] = {}
+
+MAIN_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
+MAIN_KEYBOARD.row(
+    types.KeyboardButton("/scrape"),
+    types.KeyboardButton("/exports"),
+)
+MAIN_KEYBOARD.row(
+    types.KeyboardButton("/broadcast"),
+    types.KeyboardButton("Статистика по дням"),
+)
 
 
 def _format_log_entries(entries):
@@ -65,6 +74,39 @@ def _format_log_entries(entries):
         timestamp = entry.get("timestamp", "")
         lines.append(f"{user_display} — {status} ({timestamp})")
     return "\n".join(lines)
+
+
+async def send_broadcast_stats_message(message: types.Message):
+    try:
+        response, data = await api_json(
+            "get",
+            "/broadcast_stats",
+            params={"limit": 30},
+            timeout=20,
+        )
+    except Exception as exc:
+        await message.answer(
+            f"Не удалось получить статистику рассылки: {exc}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    if response.status_code != 200 or not isinstance(data, list):
+        await message.answer(
+            f"Ошибка статистики ({response.status_code}): {response.text}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    if not data:
+        await message.answer("Пока нет данных по рассылкам.", reply_markup=MAIN_KEYBOARD)
+        return
+
+    lines = [f"{row['date']}: {row['processed']} пользователей" for row in data if row.get("date")]
+    await message.answer(
+        "Статистика по дням:\n" + "\n".join(lines),
+        reply_markup=MAIN_KEYBOARD,
+    )
 
 
 async def start_broadcast(message: types.Message, user_id: int, settings: Dict[str, Any]):
@@ -110,12 +152,6 @@ async def start_broadcast(message: types.Message, user_id: int, settings: Dict[s
             text="Остановить",
             callback_data=f"{STOP_BROADCAST_PREFIX}{job_id}",
         ),
-    )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            text="Статистика по дням",
-            callback_data=BROADCAST_STATS_CALLBACK,
-        )
     )
 
     progress_message = await waiting_msg.edit_text(
@@ -200,7 +236,7 @@ async def cmd_start(message: types.Message):
         "/broadcast – массовая рассылка по собранным пользователям.\n\n"
         "Когда нажмёшь /scrape, я попрошу ссылку или @юзернейм чата."
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=MAIN_KEYBOARD)
 
 
 @dp.message_handler(commands=["scrape"])
@@ -217,7 +253,7 @@ async def cmd_scrape(message: types.Message):
         "`@testgroup`\n\n"
         "Я запущу задачу на сбор всех доступных участников и пришлю CSV, когда она завершится."
     )
-    await message.answer(text, parse_mode="Markdown")
+    await message.answer(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
 
 
 @dp.message_handler(commands=["exports"])
@@ -225,17 +261,21 @@ async def cmd_exports(message: types.Message):
     try:
         response, data = await api_json("get", "/scrape_exports", timeout=20)
     except Exception as exc:
-        await message.answer(f"Не удалось получить список выгрузок: {exc}")
+        await message.answer(f"Не удалось получить список выгрузок: {exc}", reply_markup=MAIN_KEYBOARD)
         return
 
     if response.status_code != 200 or not isinstance(data, list):
         await message.answer(
-            f"Ошибка от сервиса экспорта ({response.status_code}): {response.text}"
+            f"Ошибка от сервиса экспорта ({response.status_code}): {response.text}",
+            reply_markup=MAIN_KEYBOARD,
         )
         return
 
     if not data:
-        await message.answer("Готовых CSV пока нет. Создай новую задачу через /scrape.")
+        await message.answer(
+            "Готовых CSV пока нет. Создай новую задачу через /scrape.",
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
@@ -264,7 +304,10 @@ async def cmd_exports(message: types.Message):
         buttons_added += 1
 
     if buttons_added == 0:
-        await message.answer("Готовых CSV пока нет. Создай новую задачу через /scrape.")
+        await message.answer(
+            "Готовых CSV пока нет. Создай новую задачу через /scrape.",
+            reply_markup=MAIN_KEYBOARD,
+        )
         return
 
     keyboard.add(
@@ -285,6 +328,16 @@ async def cmd_broadcast(message: types.Message):
         "Введите текст сообщения для рассылки:\n"
         "Рассылка пойдёт только тем пользователям, кому ещё не отправляли ранее."
     )
+
+
+@dp.message_handler(commands=["stats"])
+async def cmd_stats(message: types.Message):
+    await send_broadcast_stats_message(message)
+
+
+@dp.message_handler(lambda m: m.text and m.text.strip().lower() == "статистика по дням")
+async def handle_stats_button_text(message: types.Message):
+    await send_broadcast_stats_message(message)
 
 
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
@@ -492,7 +545,7 @@ async def handle_text(message: types.Message):
 
     else:
         # если не в режиме скрапа — просто подсказываем команды
-        await message.answer("Если хочешь собрать участников – нажми /scrape 🙂")
+        await message.answer("Если хочешь собрать участников – нажми /scrape 🙂", reply_markup=MAIN_KEYBOARD)
 
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith(CALLBACK_PREFIX))
@@ -664,34 +717,6 @@ async def handle_broadcast_info(callback_query: types.CallbackQuery):
     await callback_query.answer()
 
 
-@dp.callback_query_handler(lambda c: c.data == BROADCAST_STATS_CALLBACK)
-async def handle_broadcast_stats(callback_query: types.CallbackQuery):
-    try:
-        response, data = await api_json(
-            "get",
-            "/broadcast_stats",
-            params={"limit": 30},
-            timeout=20,
-        )
-    except Exception as exc:
-        await callback_query.message.answer(f"Не удалось получить статистику: {exc}")
-        return
-
-    if response.status_code != 200 or not isinstance(data, list):
-        await callback_query.message.answer(
-            f"Ошибка статистики ({response.status_code}): {response.text}"
-        )
-        return
-
-    if not data:
-        await callback_query.message.answer("Пока нет данных по рассылкам.")
-        return
-
-    lines = [f"{row['date']}: {row['processed']} пользователей" for row in data if row.get("date")]
-    await callback_query.message.answer(
-        "Статистика по дням:\n" + "\n".join(lines)
-    )
-    await callback_query.answer()
 
 
 if __name__ == "__main__":
