@@ -324,10 +324,10 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             await asyncio.to_thread(_write_members_csv, job_members, csv_path)
 
             logger.info(
-                "Scrape finished for %s. Total unique members stored: %d (newly added %d).",
+                "Scrape finished for %s. Added %d new members in this run (processed %d records).",
                 chat_title,
-                len(members),
-                newly_saved,
+                len(job_members),
+                processed_total,
             )
 
             await _update_job(
