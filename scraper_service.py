@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
 import re
+import tempfile
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -36,6 +37,7 @@ REQUEST_INTERVAL_SECONDS = 0.0
 JOB_RETENTION_SECONDS = 3600
 CSV_OUTPUT_DIR = os.getenv("CSV_OUTPUT_DIR", "exports")
 FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+FULL_EXPORT_NAME = "members_full.csv"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
@@ -209,6 +211,16 @@ def _clear_csv_exports() -> int:
             except FileNotFoundError:
                 continue
     return removed
+
+
+async def _write_full_export() -> str:
+    if db_conn is None:
+        raise RuntimeError("Database is not initialised.")
+    async with db_lock:
+        members = await asyncio.to_thread(_fetch_all_members_sync, db_conn)
+    csv_path = os.path.join(CSV_OUTPUT_DIR, FULL_EXPORT_NAME)
+    await asyncio.to_thread(_write_members_csv, members, csv_path)
+    return csv_path
 
 
 async def scrape_users(job_id: str, chat_value: str) -> None:
@@ -505,6 +517,13 @@ async def scrape_exports_clear():
                 job["csv_path"] = None
 
     return {"deleted": deleted}
+
+
+@app.get("/scrape_export/full")
+async def scrape_export_full():
+    path = await _write_full_export()
+    filename = os.path.basename(path)
+    return FileResponse(path, media_type="text/csv", filename=filename)
 
 
 @app.get("/scrape_result")

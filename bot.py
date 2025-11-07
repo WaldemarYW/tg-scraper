@@ -46,6 +46,7 @@ async def api_json(method: str, endpoint: str, **kwargs):
 
 CALLBACK_PREFIX = "download:"
 CLEAR_EXPORTS_CALLBACK = "clear_exports"
+FULL_EXPORT_CALLBACK = "download_full"
 export_tokens: Dict[str, str] = {}
 
 
@@ -130,6 +131,12 @@ async def cmd_exports(message: types.Message):
         types.InlineKeyboardButton(
             text="Очистить список",
             callback_data=CLEAR_EXPORTS_CALLBACK,
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="Скачать всю БД CSV",
+            callback_data=FULL_EXPORT_CALLBACK,
         )
     )
 
@@ -361,6 +368,37 @@ async def handle_clear_exports(callback_query: types.CallbackQuery):
     deleted = (data or {}).get("deleted", 0) if isinstance(data, dict) else 0
     await callback_query.message.edit_text(
         f"Список экспортов очищен. Удалено файлов: {deleted}."
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == FULL_EXPORT_CALLBACK)
+async def handle_full_export(callback_query: types.CallbackQuery):
+    await callback_query.answer("Готовлю полный экспорт…")
+
+    try:
+        response = await api_request("get", "/scrape_export/full", timeout=180)
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось получить полный экспорт: {exc}")
+        return
+
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка при экспорте ({response.status_code}): {response.text}"
+        )
+        return
+
+    filename = "members_full.csv"
+    disposition = response.headers.get("Content-Disposition")
+    if disposition and "filename=" in disposition:
+        filename = disposition.split("filename=")[-1].strip('";')
+
+    csv_bytes = io.BytesIO(response.content)
+    csv_bytes.name = filename
+
+    await bot.send_document(
+        callback_query.from_user.id,
+        types.InputFile(csv_bytes),
+        caption="Полный экспорт всех участников.",
     )
 
 
