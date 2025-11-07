@@ -73,7 +73,6 @@ class Member(BaseModel):
     last_broadcast_at: Optional[str] = None
     last_broadcast_status: Optional[str] = None
     is_hr: bool = False
-    source_chat: Optional[str] = None
 
 
 class JobResponse(BaseModel):
@@ -104,14 +103,11 @@ class BroadcastRequest(BaseModel):
     text: str
     limit: Optional[int] = None
     interval_seconds: float = 0.0
-    source_chat: Optional[str] = None
-    chat_title: Optional[str] = None
 
 
 class BroadcastJobResponse(BaseModel):
     job_id: str
     status: str
-    source_chat: Optional[str] = None
 
 
 class BroadcastStatusResponse(BaseModel):
@@ -125,8 +121,6 @@ class BroadcastStatusResponse(BaseModel):
     finished_at: Optional[str] = None
     cancel_requested: bool
     message: Optional[str] = None
-    source_chat: Optional[str] = None
-    chat_title: Optional[str] = None
 
 
 class BroadcastLogEntry(BaseModel):
@@ -142,7 +136,6 @@ class BroadcastLogResponse(BaseModel):
     total: int
     next_offset: Optional[int]
     has_more: bool
-    source_chat: Optional[str] = None
 
 
 class BroadcastStatsEntry(BaseModel):
@@ -182,8 +175,6 @@ def _ensure_member_columns(conn: sqlite3.Connection) -> None:
                 THEN 1 ELSE 0 END
             """
         )
-    if "source_chat" not in existing:
-        conn.execute("ALTER TABLE members ADD COLUMN source_chat TEXT")
     conn.commit()
 
 
@@ -340,22 +331,17 @@ def _clear_csv_exports() -> int:
 
 
 def _fetch_pending_broadcast_members_sync(
-    conn: sqlite3.Connection, limit: Optional[int], source_chat: Optional[str]
+    conn: sqlite3.Connection, limit: Optional[int]
 ) -> List[Member]:
     query = """
-        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0), source_chat
+        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0)
         FROM members
         WHERE last_broadcast_at IS NULL AND IFNULL(is_hr, 0) = 0
+        ORDER BY added_at ASC
     """
-    params: List[Any] = []
-    if source_chat:
-        query += " AND source_chat = ?"
-        params.append(source_chat)
-
-    query += " ORDER BY added_at ASC"
     if limit is not None and limit > 0:
         query += f" LIMIT {int(limit)}"
-    cursor = conn.execute(query, tuple(params))
+    cursor = conn.execute(query)
     rows = cursor.fetchall()
     return [
         Member(
@@ -368,7 +354,6 @@ def _fetch_pending_broadcast_members_sync(
             last_broadcast_at=row[6],
             last_broadcast_status=row[7],
             is_hr=bool(row[8]),
-            source_chat=row[9],
         )
         for row in rows
     ]
@@ -705,8 +690,7 @@ def init_db() -> sqlite3.Connection:
             added_at TEXT NOT NULL,
             last_broadcast_at TEXT,
             last_broadcast_status TEXT,
-            is_hr INTEGER DEFAULT 0,
-            source_chat TEXT
+            is_hr INTEGER DEFAULT 0
         )
         """
     )
@@ -733,17 +717,15 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
             added_at,
             last_broadcast_at,
             last_broadcast_status,
-            is_hr,
-            source_chat
+            is_hr
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             username = excluded.username,
             first_name = excluded.first_name,
             last_name = excluded.last_name,
             phone = excluded.phone,
-            is_hr = excluded.is_hr,
-            source_chat = COALESCE(excluded.source_chat, members.source_chat)
+            is_hr = excluded.is_hr
         """,
         (
             member.id,
@@ -755,7 +737,6 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
             member.last_broadcast_at,
             member.last_broadcast_status,
             int(member.is_hr),
-            member.source_chat,
         ),
     )
     conn.commit()
@@ -764,7 +745,7 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
 def _fetch_all_members_sync(conn: sqlite3.Connection) -> List[Member]:
     cursor = conn.execute(
         """
-        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0), source_chat
+        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0)
         FROM members
         ORDER BY added_at ASC
         """
@@ -781,7 +762,6 @@ def _fetch_all_members_sync(conn: sqlite3.Connection) -> List[Member]:
             last_broadcast_at=row[6],
             last_broadcast_status=row[7],
             is_hr=bool(row[8]),
-            source_chat=row[9],
         )
         for row in rows
     ]
@@ -862,14 +842,12 @@ async def send_start(req: BroadcastRequest):
 
     limit = req.limit if req.limit and req.limit > 0 else None
     interval = max(0.0, req.interval_seconds or 0.0)
-    source_chat = (req.source_chat or "").strip() or None
 
     async with db_lock:
         recipients = await asyncio.to_thread(
             _fetch_pending_broadcast_members_sync,
             db_conn,
             limit,
-            source_chat,
         )
 
     if not recipients:
@@ -892,8 +870,6 @@ async def send_start(req: BroadcastRequest):
             "sent_failed": 0,
             "limit": limit,
             "interval": interval,
-            "source_chat": source_chat,
-            "chat_title": req.chat_title,
             "started_at": _current_iso(),
             "finished_at": None,
             "cancel_requested": False,
@@ -938,8 +914,6 @@ async def send_status(job_id: str):
         finished_at=job.get("finished_at"),
         cancel_requested=job.get("cancel_requested", False),
         message=job.get("message"),
-        source_chat=job.get("source_chat"),
-        chat_title=job.get("chat_title"),
     )
 
 
@@ -979,7 +953,6 @@ async def send_log(job_id: str, offset: int = 0, limit: int = 10):
         total=total,
         next_offset=next_offset if has_more else None,
         has_more=has_more,
-        source_chat=BROADCAST_JOBS.get(job_id, {}).get("source_chat"),
     )
 
 
