@@ -386,13 +386,12 @@ async def send_chat_selection(target_message: types.Message, user_id: int):
     page = chats[offset : offset + 5]
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    for chat in page:
+    for idx, chat in enumerate(page, start=offset):
         title = chat.get("chat_title") or chat.get("filename")
-        source_chat = chat.get("source_chat") or chat.get("chat_title")
         keyboard.add(
             types.InlineKeyboardButton(
                 text=title,
-                callback_data=f"broadcast_select:{source_chat}:{title}",
+                callback_data=f"broadcast_select:{idx}",
             )
         )
 
@@ -735,7 +734,7 @@ async def handle_broadcast_prev(callback_query: types.CallbackQuery):
         return
     offset = max(0, state.get("chat_offset", 0) - 5)
     state["chat_offset"] = offset
-    await callback_query.message.delete()
+    await callback_query.answer()
     await send_chat_selection(callback_query.message, user_id)
 
 
@@ -750,7 +749,7 @@ async def handle_broadcast_next(callback_query: types.CallbackQuery):
     if offset >= len(state.get("chats", [])):
         offset = state.get("chat_offset", 0)
     state["chat_offset"] = offset
-    await callback_query.message.delete()
+    await callback_query.answer()
     await send_chat_selection(callback_query.message, user_id)
 
 
@@ -764,17 +763,23 @@ async def handle_broadcast_cancel(callback_query: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("broadcast_select:"))
 async def handle_broadcast_select(callback_query: types.CallbackQuery):
-    try:
-        _, source_chat, chat_title = callback_query.data.split(":", 2)
-    except ValueError:
-        await callback_query.answer("Некорректный выбор.", show_alert=True)
-        return
-
     user_id = callback_query.from_user.id
     state = broadcast_states.get(user_id)
     if not state:
         await callback_query.answer("Сессия рассылки не найдена.", show_alert=True)
         return
+    try:
+        index = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректный выбор.", show_alert=True)
+        return
+    chats = state.get("chats", [])
+    if index < 0 or index >= len(chats):
+        await callback_query.answer("Чат не найден.", show_alert=True)
+        return
+    selected = chats[index]
+    source_chat = selected.get("source_chat") or selected.get("chat_title") or selected.get("filename")
+    chat_title = selected.get("chat_title") or selected.get("filename")
 
     state["source_chat"] = source_chat
     state["chat_title"] = chat_title
