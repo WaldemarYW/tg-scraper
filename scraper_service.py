@@ -105,11 +105,13 @@ class BroadcastRequest(BaseModel):
     limit: Optional[int] = None
     interval_seconds: float = 0.0
     source_chat: Optional[str] = None
+    chat_title: Optional[str] = None
 
 
 class BroadcastJobResponse(BaseModel):
     job_id: str
     status: str
+    source_chat: Optional[str] = None
 
 
 class BroadcastStatusResponse(BaseModel):
@@ -123,6 +125,8 @@ class BroadcastStatusResponse(BaseModel):
     finished_at: Optional[str] = None
     cancel_requested: bool
     message: Optional[str] = None
+    source_chat: Optional[str] = None
+    chat_title: Optional[str] = None
 
 
 class BroadcastLogEntry(BaseModel):
@@ -138,6 +142,7 @@ class BroadcastLogResponse(BaseModel):
     total: int
     next_offset: Optional[int]
     has_more: bool
+    source_chat: Optional[str] = None
 
 
 class BroadcastStatsEntry(BaseModel):
@@ -888,6 +893,7 @@ async def send_start(req: BroadcastRequest):
             "limit": limit,
             "interval": interval,
             "source_chat": source_chat,
+            "chat_title": req.chat_title,
             "started_at": _current_iso(),
             "finished_at": None,
             "cancel_requested": False,
@@ -932,6 +938,8 @@ async def send_status(job_id: str):
         finished_at=job.get("finished_at"),
         cancel_requested=job.get("cancel_requested", False),
         message=job.get("message"),
+        source_chat=job.get("source_chat"),
+        chat_title=job.get("chat_title"),
     )
 
 
@@ -971,6 +979,7 @@ async def send_log(job_id: str, offset: int = 0, limit: int = 10):
         total=total,
         next_offset=next_offset if has_more else None,
         has_more=has_more,
+        source_chat=BROADCAST_JOBS.get(job_id, {}).get("source_chat"),
     )
 
 
