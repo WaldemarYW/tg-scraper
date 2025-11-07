@@ -498,14 +498,6 @@ def _resolve_csv_path(filename: str) -> str:
     return abs_path
 
 
-@app.get("/scrape_export/{filename}")
-async def scrape_export(filename: str):
-    path = _resolve_csv_path(filename)
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="File not found")
-    return FileResponse(path, media_type="text/csv", filename=filename)
-
-
 @app.post("/scrape_exports/clear")
 async def scrape_exports_clear():
     deleted = await asyncio.to_thread(_clear_csv_exports)
@@ -523,6 +515,14 @@ async def scrape_exports_clear():
 async def scrape_export_full():
     path = await _write_full_export()
     filename = os.path.basename(path)
+    return FileResponse(path, media_type="text/csv", filename=filename)
+
+
+@app.get("/scrape_export/{filename}")
+async def scrape_export(filename: str):
+    path = _resolve_csv_path(filename)
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="File not found")
     return FileResponse(path, media_type="text/csv", filename=filename)
 
 
