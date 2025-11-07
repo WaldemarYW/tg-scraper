@@ -122,6 +122,26 @@ class BroadcastStatusResponse(BaseModel):
     message: Optional[str] = None
 
 
+class BroadcastLogEntry(BaseModel):
+    member_id: int
+    username: Optional[str]
+    status: str
+    timestamp: str
+
+
+class BroadcastLogResponse(BaseModel):
+    job_id: str
+    entries: List[BroadcastLogEntry]
+    total: int
+    next_offset: Optional[int]
+    has_more: bool
+
+
+class BroadcastStatsEntry(BaseModel):
+    date: str
+    processed: int
+
+
 def _current_iso() -> str:
     return datetime.utcnow().isoformat()
 
@@ -142,6 +162,22 @@ def _ensure_member_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE members ADD COLUMN last_broadcast_at TEXT")
     if "last_broadcast_status" not in existing:
         conn.execute("ALTER TABLE members ADD COLUMN last_broadcast_status TEXT")
+    conn.commit()
+
+
+def _ensure_broadcast_history_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS broadcast_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_id TEXT NOT NULL,
+            member_id INTEGER NOT NULL,
+            username TEXT,
+            status TEXT NOT NULL,
+            timestamp TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
 
 
@@ -314,6 +350,69 @@ def _mark_member_broadcast_status_sync(
         (timestamp, status, member_id),
     )
     conn.commit()
+
+
+def _insert_broadcast_log_sync(
+    conn: sqlite3.Connection,
+    job_id: str,
+    member: Member,
+    status: str,
+    timestamp: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO broadcast_history (job_id, member_id, username, status, timestamp)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (job_id, member.id, member.username, status, timestamp),
+    )
+    conn.commit()
+
+
+def _fetch_broadcast_logs_sync(
+    conn: sqlite3.Connection, job_id: str, offset: int, limit: int
+) -> Dict[str, Any]:
+    cursor = conn.execute(
+        """
+        SELECT id, member_id, username, status, timestamp
+        FROM broadcast_history
+        WHERE job_id = ?
+        ORDER BY id DESC
+        LIMIT ? OFFSET ?
+        """,
+        (job_id, limit, offset),
+    )
+    rows = cursor.fetchall()
+    total_cursor = conn.execute(
+        "SELECT COUNT(*) FROM broadcast_history WHERE job_id = ?", (job_id,)
+    )
+    total = total_cursor.fetchone()[0]
+    entries = [
+        {
+            "member_id": row[1],
+            "username": row[2],
+            "status": row[3],
+            "timestamp": row[4],
+        }
+        for row in rows
+    ]
+    return {"entries": entries, "total": total}
+
+
+def _fetch_broadcast_stats_sync(conn: sqlite3.Connection, limit: Optional[int]) -> List[Dict[str, Any]]:
+    query = """
+        SELECT substr(timestamp, 1, 10) as day, COUNT(*) as processed
+        FROM broadcast_history
+        GROUP BY day
+        ORDER BY day DESC
+    """
+    params: tuple = ()
+    if limit and limit > 0:
+        query += " LIMIT ?"
+        params = (limit,)
+    cursor = conn.execute(query, params)
+    rows = cursor.fetchall()
+    return [{"date": row[0], "processed": row[1]} for row in rows]
 
 
 async def _write_full_export() -> str:
@@ -499,6 +598,14 @@ async def broadcast_users(job_id: str, text: str, interval: float, recipients: L
                     timestamp,
                     status,
                 )
+                await asyncio.to_thread(
+                    _insert_broadcast_log_sync,
+                    db_conn,
+                    job_id,
+                    member,
+                    status,
+                    timestamp,
+                )
 
             await _update_broadcast_job(
                 job_id,
@@ -556,6 +663,7 @@ def init_db() -> sqlite3.Connection:
     )
     conn.commit()
     _ensure_member_columns(conn)
+    _ensure_broadcast_history_table(conn)
     return conn
 
 
@@ -770,6 +878,65 @@ async def send_status(job_id: str):
         cancel_requested=job.get("cancel_requested", False),
         message=job.get("message"),
     )
+
+
+@app.get("/send_log", response_model=BroadcastLogResponse)
+async def send_log(job_id: str, offset: int = 0, limit: int = 10):
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+
+    if limit <= 0 or limit > 100:
+        raise HTTPException(status_code=400, detail="Limit must be between 1 and 100.")
+
+    async with db_lock:
+        result = await asyncio.to_thread(
+            _fetch_broadcast_logs_sync,
+            db_conn,
+            job_id,
+            offset,
+            limit,
+        )
+
+    entries = [
+        BroadcastLogEntry(
+            member_id=entry["member_id"],
+            username=entry["username"],
+            status=entry["status"],
+            timestamp=entry["timestamp"],
+        )
+        for entry in result["entries"]
+    ]
+    total = result["total"]
+    next_offset = offset + len(entries) if entries else None
+    has_more = next_offset is not None and next_offset < total
+
+    return BroadcastLogResponse(
+        job_id=job_id,
+        entries=entries,
+        total=total,
+        next_offset=next_offset if has_more else None,
+        has_more=has_more,
+    )
+
+
+@app.get("/broadcast_stats", response_model=List[BroadcastStatsEntry])
+async def broadcast_stats(limit: int = 30):
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    if limit <= 0:
+        limit = 30
+
+    async with db_lock:
+        rows = await asyncio.to_thread(
+            _fetch_broadcast_stats_sync,
+            db_conn,
+            limit,
+        )
+
+    return [
+        BroadcastStatsEntry(date=row["date"], processed=row["processed"])
+        for row in rows
+    ]
 
 
 @app.get("/scrape_exports", response_model=List[CSVExport])

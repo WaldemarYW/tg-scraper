@@ -49,7 +49,22 @@ CALLBACK_PREFIX = "download:"
 CLEAR_EXPORTS_CALLBACK = "clear_exports"
 FULL_EXPORT_CALLBACK = "download_full"
 STOP_BROADCAST_PREFIX = "stop_broadcast:"
+BROADCAST_INFO_PREFIX = "broadcast_info:"
+BROADCAST_STATS_CALLBACK = "broadcast_stats"
 export_tokens: Dict[str, str] = {}
+
+
+def _format_log_entries(entries):
+    if not entries:
+        return "Нет записей."
+    lines = []
+    for entry in entries:
+        username = entry.get("username") or "-"
+        user_display = f"@{username}" if username not in ("-", None) else f"id:{entry.get('member_id')}"
+        status = entry.get("status", "unknown")
+        timestamp = entry.get("timestamp", "")
+        lines.append(f"{user_display} — {status} ({timestamp})")
+    return "\n".join(lines)
 
 
 async def start_broadcast(message: types.Message, user_id: int, settings: Dict[str, Any]):
@@ -85,10 +100,21 @@ async def start_broadcast(message: types.Message, user_id: int, settings: Dict[s
         await waiting_msg.edit_text("Сервис не вернул идентификатор рассылки.")
         return
 
-    keyboard = types.InlineKeyboardMarkup().add(
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.add(
         types.InlineKeyboardButton(
-            text="Остановить рассылку",
+            text="Последние 10",
+            callback_data=f"{BROADCAST_INFO_PREFIX}{job_id}:0",
+        ),
+        types.InlineKeyboardButton(
+            text="Остановить",
             callback_data=f"{STOP_BROADCAST_PREFIX}{job_id}",
+        ),
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="Статистика по дням",
+            callback_data=BROADCAST_STATS_CALLBACK,
         )
     )
 
@@ -170,7 +196,8 @@ async def cmd_start(message: types.Message):
         "Я бот для скрапа участников из групп/каналов.\n\n"
         "Команды:\n"
         "/scrape – создать новую задачу на сбор участников и получить CSV после завершения.\n"
-        "/exports – список всех готовых выгрузок.\n\n"
+        "/exports – список всех готовых выгрузок.\n"
+        "/broadcast – массовая рассылка по собранным пользователям.\n\n"
         "Когда нажмёшь /scrape, я попрошу ссылку или @юзернейм чата."
     )
     await message.answer(text)
@@ -584,6 +611,87 @@ async def handle_stop_broadcast(callback_query: types.CallbackQuery):
 
     status_msg = (data or {}).get("status", "unknown") if isinstance(data, dict) else "unknown"
     await callback_query.message.answer(f"Статус остановки для `{job_id}`: {status_msg}", parse_mode="Markdown")
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(BROADCAST_INFO_PREFIX))
+async def handle_broadcast_info(callback_query: types.CallbackQuery):
+    payload = callback_query.data[len(BROADCAST_INFO_PREFIX) :]
+    if ":" in payload:
+        job_id, offset_raw = payload.split(":", 1)
+        try:
+            offset = int(offset_raw)
+        except ValueError:
+            offset = 0
+    else:
+        job_id = payload
+        offset = 0
+
+    try:
+        response, data = await api_json(
+            "get",
+            "/send_log",
+            params={"job_id": job_id, "offset": offset, "limit": 10},
+            timeout=20,
+        )
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось получить лог рассылки: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, dict):
+        await callback_query.message.answer(
+            f"Ошибка логов ({response.status_code}): {response.text}"
+        )
+        return
+
+    entries = data.get("entries", [])
+    text = _format_log_entries(entries)
+
+    reply_markup = None
+    next_offset = data.get("next_offset")
+    if data.get("has_more") and next_offset is not None:
+        reply_markup = types.InlineKeyboardMarkup().add(
+            types.InlineKeyboardButton(
+                text="Показать ещё",
+                callback_data=f"{BROADCAST_INFO_PREFIX}{job_id}:{next_offset}",
+            )
+        )
+
+    await callback_query.message.answer(
+        f"Последние записи рассылки `{job_id}`:\n{text}",
+        parse_mode="Markdown",
+        reply_markup=reply_markup,
+    )
+    await callback_query.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == BROADCAST_STATS_CALLBACK)
+async def handle_broadcast_stats(callback_query: types.CallbackQuery):
+    try:
+        response, data = await api_json(
+            "get",
+            "/broadcast_stats",
+            params={"limit": 30},
+            timeout=20,
+        )
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось получить статистику: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, list):
+        await callback_query.message.answer(
+            f"Ошибка статистики ({response.status_code}): {response.text}"
+        )
+        return
+
+    if not data:
+        await callback_query.message.answer("Пока нет данных по рассылкам.")
+        return
+
+    lines = [f"{row['date']}: {row['processed']} пользователей" for row in data if row.get("date")]
+    await callback_query.message.answer(
+        "Статистика по дням:\n" + "\n".join(lines)
+    )
+    await callback_query.answer()
 
 
 if __name__ == "__main__":
