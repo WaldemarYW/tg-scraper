@@ -72,6 +72,7 @@ class Member(BaseModel):
     added_at: str
     last_broadcast_at: Optional[str] = None
     last_broadcast_status: Optional[str] = None
+    is_hr: bool = False
 
 
 class JobResponse(BaseModel):
@@ -162,6 +163,18 @@ def _ensure_member_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE members ADD COLUMN last_broadcast_at TEXT")
     if "last_broadcast_status" not in existing:
         conn.execute("ALTER TABLE members ADD COLUMN last_broadcast_status TEXT")
+    if "is_hr" not in existing:
+        conn.execute("ALTER TABLE members ADD COLUMN is_hr INTEGER DEFAULT 0")
+        conn.execute(
+            """
+            UPDATE members
+            SET is_hr = CASE
+                WHEN LOWER(IFNULL(username, '')) LIKE '%hr%'
+                  OR LOWER(IFNULL(first_name, '')) LIKE '%hr%'
+                  OR LOWER(IFNULL(last_name, '')) LIKE '%hr%'
+                THEN 1 ELSE 0 END
+            """
+        )
     conn.commit()
 
 
@@ -261,6 +274,13 @@ def _fallback_from_chat_value(value: str) -> str:
     return stripped
 
 
+def _is_hr_candidate(*values: Optional[str]) -> bool:
+    for value in values:
+        if value and "hr" in value.lower():
+            return True
+    return False
+
+
 def _list_csv_exports() -> List[CSVExport]:
     exports: List[CSVExport] = []
     base_path = os.path.abspath(CSV_OUTPUT_DIR)
@@ -314,9 +334,9 @@ def _fetch_pending_broadcast_members_sync(
     conn: sqlite3.Connection, limit: Optional[int]
 ) -> List[Member]:
     query = """
-        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status
+        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0)
         FROM members
-        WHERE last_broadcast_at IS NULL
+        WHERE last_broadcast_at IS NULL AND IFNULL(is_hr, 0) = 0
         ORDER BY added_at ASC
     """
     if limit is not None and limit > 0:
@@ -333,6 +353,7 @@ def _fetch_pending_broadcast_members_sync(
             added_at=row[5],
             last_broadcast_at=row[6],
             last_broadcast_status=row[7],
+            is_hr=bool(row[8]),
         )
         for row in rows
     ]
@@ -483,6 +504,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                     last_name=user.last_name,
                     phone=user.phone,
                     added_at=datetime.utcnow().isoformat(),
+                    is_hr=_is_hr_candidate(user.username, user.first_name, user.last_name),
                 )
 
                 if is_new:
@@ -566,6 +588,16 @@ async def broadcast_users(job_id: str, text: str, interval: float, recipients: L
         for member in recipients:
             if job.get("cancel_requested"):
                 break
+
+            if member.is_hr:
+                processed += 1
+                await _update_broadcast_job(
+                    job_id,
+                    processed=processed,
+                    last_member_id=member.id,
+                    last_member_status="skipped_hr",
+                )
+                continue
 
             target = member.username or member.id
             status = "skipped"
@@ -657,7 +689,8 @@ def init_db() -> sqlite3.Connection:
             phone TEXT,
             added_at TEXT NOT NULL,
             last_broadcast_at TEXT,
-            last_broadcast_status TEXT
+            last_broadcast_status TEXT,
+            is_hr INTEGER DEFAULT 0
         )
         """
     )
@@ -683,14 +716,16 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
             phone,
             added_at,
             last_broadcast_at,
-            last_broadcast_status
+            last_broadcast_status,
+            is_hr
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             username = excluded.username,
             first_name = excluded.first_name,
             last_name = excluded.last_name,
-            phone = excluded.phone
+            phone = excluded.phone,
+            is_hr = excluded.is_hr
         """,
         (
             member.id,
@@ -701,6 +736,7 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
             member.added_at,
             member.last_broadcast_at,
             member.last_broadcast_status,
+            int(member.is_hr),
         ),
     )
     conn.commit()
@@ -709,7 +745,7 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
 def _fetch_all_members_sync(conn: sqlite3.Connection) -> List[Member]:
     cursor = conn.execute(
         """
-        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status
+        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0)
         FROM members
         ORDER BY added_at ASC
         """
@@ -725,6 +761,7 @@ def _fetch_all_members_sync(conn: sqlite3.Connection) -> List[Member]:
             added_at=row[5],
             last_broadcast_at=row[6],
             last_broadcast_status=row[7],
+            is_hr=bool(row[8]),
         )
         for row in rows
     ]
