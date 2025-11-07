@@ -49,6 +49,9 @@ db_lock = asyncio.Lock()
 scrape_lock = asyncio.Lock()
 SCRAPE_JOBS: Dict[str, Dict[str, Any]] = {}
 jobs_lock = asyncio.Lock()
+broadcast_lock = asyncio.Lock()
+BROADCAST_JOBS: Dict[str, Dict[str, Any]] = {}
+current_broadcast_job_id: Optional[str] = None
 
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 
@@ -67,6 +70,8 @@ class Member(BaseModel):
     last_name: Optional[str]
     phone: Optional[str]
     added_at: str
+    last_broadcast_at: Optional[str] = None
+    last_broadcast_status: Optional[str] = None
 
 
 class JobResponse(BaseModel):
@@ -93,6 +98,30 @@ class CSVExport(BaseModel):
     url: str
 
 
+class BroadcastRequest(BaseModel):
+    text: str
+    limit: Optional[int] = None
+    interval_seconds: float = 0.0
+
+
+class BroadcastJobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+class BroadcastStatusResponse(BaseModel):
+    job_id: str
+    status: str
+    total: int
+    processed: int
+    sent_success: int
+    sent_failed: int
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    cancel_requested: bool
+    message: Optional[str] = None
+
+
 def _current_iso() -> str:
     return datetime.utcnow().isoformat()
 
@@ -106,9 +135,28 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _ensure_member_columns(conn: sqlite3.Connection) -> None:
+    cursor = conn.execute("PRAGMA table_info(members)")
+    existing = {row[1] for row in cursor.fetchall()}
+    if "last_broadcast_at" not in existing:
+        conn.execute("ALTER TABLE members ADD COLUMN last_broadcast_at TEXT")
+    if "last_broadcast_status" not in existing:
+        conn.execute("ALTER TABLE members ADD COLUMN last_broadcast_status TEXT")
+    conn.commit()
+
+
 async def _update_job(job_id: str, **kwargs: Any) -> None:
     async with jobs_lock:
         job = SCRAPE_JOBS.get(job_id)
+        if job is None:
+            return
+        for key, value in kwargs.items():
+            job[key] = value
+
+
+async def _update_broadcast_job(job_id: str, **kwargs: Any) -> None:
+    async with broadcast_lock:
+        job = BROADCAST_JOBS.get(job_id)
         if job is None:
             return
         for key, value in kwargs.items():
@@ -222,6 +270,50 @@ def _clear_csv_exports() -> int:
             except FileNotFoundError:
                 continue
     return removed
+
+
+
+
+def _fetch_pending_broadcast_members_sync(
+    conn: sqlite3.Connection, limit: Optional[int]
+) -> List[Member]:
+    query = """
+        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status
+        FROM members
+        WHERE last_broadcast_at IS NULL
+        ORDER BY added_at ASC
+    """
+    if limit is not None and limit > 0:
+        query += f" LIMIT {int(limit)}"
+    cursor = conn.execute(query)
+    rows = cursor.fetchall()
+    return [
+        Member(
+            id=row[0],
+            username=row[1],
+            first_name=row[2],
+            last_name=row[3],
+            phone=row[4],
+            added_at=row[5],
+            last_broadcast_at=row[6],
+            last_broadcast_status=row[7],
+        )
+        for row in rows
+    ]
+
+
+def _mark_member_broadcast_status_sync(
+    conn: sqlite3.Connection, member_id: int, timestamp: str, status: str
+) -> None:
+    conn.execute(
+        """
+        UPDATE members
+        SET last_broadcast_at = ?, last_broadcast_status = ?
+        WHERE id = ?
+        """,
+        (timestamp, status, member_id),
+    )
+    conn.commit()
 
 
 async def _write_full_export() -> str:
@@ -364,6 +456,88 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
         logger.exception("Scrape job %s failed: %s", job_id, exc)
 
 
+async def broadcast_users(job_id: str, text: str, interval: float, recipients: List[Member]) -> None:
+    global current_broadcast_job_id
+    job = BROADCAST_JOBS[job_id]
+    processed = 0
+    sent_success = 0
+    sent_failed = 0
+
+    try:
+        for member in recipients:
+            if job.get("cancel_requested"):
+                break
+
+            target = member.username or member.id
+            status = "skipped"
+
+            while True:
+                try:
+                    await client.send_message(target, text)
+                    sent_success += 1
+                    status = "sent"
+                    break
+                except FloodWaitError as e:
+                    await asyncio.sleep(e.seconds + 1)
+                    continue
+                except RPCError as e:
+                    sent_failed += 1
+                    status = f"rpc_error:{e.__class__.__name__}"
+                    break
+                except Exception as e:
+                    sent_failed += 1
+                    status = f"error:{e}"
+                    break
+
+            processed += 1
+            timestamp = _current_iso()
+            async with db_lock:
+                await asyncio.to_thread(
+                    _mark_member_broadcast_status_sync,
+                    db_conn,
+                    member.id,
+                    timestamp,
+                    status,
+                )
+
+            await _update_broadcast_job(
+                job_id,
+                processed=processed,
+                sent_success=sent_success,
+                sent_failed=sent_failed,
+                last_member_id=member.id,
+                last_member_status=status,
+            )
+
+            if job.get("cancel_requested"):
+                break
+
+            if interval > 0:
+                await asyncio.sleep(interval)
+
+        status_value = "cancelled" if job.get("cancel_requested") else "done"
+        await _update_broadcast_job(
+            job_id,
+            status=status_value,
+            finished_at=_current_iso(),
+            processed=processed,
+            sent_success=sent_success,
+            sent_failed=sent_failed,
+        )
+    except Exception as exc:
+        await _update_broadcast_job(
+            job_id,
+            status="error",
+            finished_at=_current_iso(),
+            message=str(exc),
+        )
+        logger.exception("Broadcast job %s failed: %s", job_id, exc)
+    finally:
+        async with broadcast_lock:
+            if current_broadcast_job_id == job_id:
+                current_broadcast_job_id = None
+
+
 def init_db() -> sqlite3.Connection:
     conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
     conn.execute(
@@ -374,11 +548,14 @@ def init_db() -> sqlite3.Connection:
             first_name TEXT,
             last_name TEXT,
             phone TEXT,
-            added_at TEXT NOT NULL
+            added_at TEXT NOT NULL,
+            last_broadcast_at TEXT,
+            last_broadcast_status TEXT
         )
         """
     )
     conn.commit()
+    _ensure_member_columns(conn)
     return conn
 
 
@@ -390,8 +567,17 @@ def _fetch_existing_ids_sync(conn: sqlite3.Connection) -> Set[int]:
 def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
     conn.execute(
         """
-        INSERT INTO members (id, username, first_name, last_name, phone, added_at)
-        VALUES (?, ?, ?, ?, ?, ?)
+        INSERT INTO members (
+            id,
+            username,
+            first_name,
+            last_name,
+            phone,
+            added_at,
+            last_broadcast_at,
+            last_broadcast_status
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             username = excluded.username,
             first_name = excluded.first_name,
@@ -405,6 +591,8 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
             member.last_name,
             member.phone,
             member.added_at,
+            member.last_broadcast_at,
+            member.last_broadcast_status,
         ),
     )
     conn.commit()
@@ -413,7 +601,7 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
 def _fetch_all_members_sync(conn: sqlite3.Connection) -> List[Member]:
     cursor = conn.execute(
         """
-        SELECT id, username, first_name, last_name, phone, added_at
+        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status
         FROM members
         ORDER BY added_at ASC
         """
@@ -427,6 +615,8 @@ def _fetch_all_members_sync(conn: sqlite3.Connection) -> List[Member]:
             last_name=row[3],
             phone=row[4],
             added_at=row[5],
+            last_broadcast_at=row[6],
+            last_broadcast_status=row[7],
         )
         for row in rows
     ]
@@ -493,6 +683,93 @@ async def scrape_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return JobStatusResponse(job_id=job_id, **job)
+
+
+@app.post("/send_start", response_model=BroadcastJobResponse, status_code=202)
+async def send_start(req: BroadcastRequest):
+    global current_broadcast_job_id
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Broadcast text is required.")
+
+    limit = req.limit if req.limit and req.limit > 0 else None
+    interval = max(0.0, req.interval_seconds or 0.0)
+
+    async with db_lock:
+        recipients = await asyncio.to_thread(
+            _fetch_pending_broadcast_members_sync,
+            db_conn,
+            limit,
+        )
+
+    if not recipients:
+        raise HTTPException(status_code=400, detail="No recipients available for broadcast.")
+
+    job_id = str(uuid.uuid4())
+
+    async with broadcast_lock:
+        if current_broadcast_job_id:
+            previous_job = BROADCAST_JOBS.get(current_broadcast_job_id)
+            if previous_job and previous_job.get("status") == "running":
+                previous_job["cancel_requested"] = True
+                previous_job["message"] = "Superseded by a new broadcast."
+        BROADCAST_JOBS[job_id] = {
+            "status": "running",
+            "text": text,
+            "total": len(recipients),
+            "processed": 0,
+            "sent_success": 0,
+            "sent_failed": 0,
+            "limit": limit,
+            "interval": interval,
+            "started_at": _current_iso(),
+            "finished_at": None,
+            "cancel_requested": False,
+            "message": None,
+        }
+        current_broadcast_job_id = job_id
+
+    task = asyncio.create_task(broadcast_users(job_id, text, interval, recipients))
+    async with broadcast_lock:
+        BROADCAST_JOBS[job_id]["task"] = task
+
+    return BroadcastJobResponse(job_id=job_id, status="started")
+
+
+@app.post("/send_stop")
+async def send_stop(job_id: str):
+    async with broadcast_lock:
+        job = BROADCAST_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Broadcast job not found.")
+        if job.get("status") != "running":
+            return {"status": job.get("status"), "message": "Job is not running."}
+        job["cancel_requested"] = True
+        job["message"] = "Cancellation requested by user."
+    return {"status": "cancelling"}
+
+
+@app.get("/send_status", response_model=BroadcastStatusResponse)
+async def send_status(job_id: str):
+    async with broadcast_lock:
+        job = BROADCAST_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Broadcast job not found.")
+    return BroadcastStatusResponse(
+        job_id=job_id,
+        status=job.get("status"),
+        total=job.get("total", 0),
+        processed=job.get("processed", 0),
+        sent_success=job.get("sent_success", 0),
+        sent_failed=job.get("sent_failed", 0),
+        started_at=job.get("started_at"),
+        finished_at=job.get("finished_at"),
+        cancel_requested=job.get("cancel_requested", False),
+        message=job.get("message"),
+    )
 
 
 @app.get("/scrape_exports", response_model=List[CSVExport])

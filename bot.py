@@ -4,7 +4,7 @@ import os
 import io
 import logging
 import uuid
-from typing import Dict
+from typing import Dict, Any
 
 import requests
 from aiogram import Bot, Dispatcher, executor, types
@@ -23,6 +23,7 @@ dp = Dispatcher(bot)
 
 # Простое хранение "состояния" в памяти: кто сейчас вводит ссылку для скрапа
 user_states: Dict[int, str] = {}  # user_id -> "waiting_for_chat"
+broadcast_states: Dict[int, Dict[str, Any]] = {}
 
 
 async def api_request(method: str, endpoint: str, **kwargs):
@@ -47,7 +48,119 @@ async def api_json(method: str, endpoint: str, **kwargs):
 CALLBACK_PREFIX = "download:"
 CLEAR_EXPORTS_CALLBACK = "clear_exports"
 FULL_EXPORT_CALLBACK = "download_full"
+STOP_BROADCAST_PREFIX = "stop_broadcast:"
 export_tokens: Dict[str, str] = {}
+
+
+async def start_broadcast(message: types.Message, user_id: int, settings: Dict[str, Any]):
+    text = settings.get("text", "").strip()
+    limit = settings.get("limit")
+    interval = settings.get("interval", 0.0)
+
+    waiting_msg = await message.answer("Запускаю рассылку... ⏳")
+
+    try:
+        response, data = await api_json(
+            "post",
+            "/send_start",
+            json={
+                "text": text,
+                "limit": limit,
+                "interval_seconds": interval,
+            },
+            timeout=30,
+        )
+    except Exception as exc:
+        await waiting_msg.edit_text(f"Не удалось запустить рассылку: {exc}")
+        return
+
+    if response.status_code != 202 or not isinstance(data, dict):
+        await waiting_msg.edit_text(
+            f"Ошибка запуска рассылки ({response.status_code}): {response.text}"
+        )
+        return
+
+    job_id = data.get("job_id")
+    if not job_id:
+        await waiting_msg.edit_text("Сервис не вернул идентификатор рассылки.")
+        return
+
+    keyboard = types.InlineKeyboardMarkup().add(
+        types.InlineKeyboardButton(
+            text="Остановить рассылку",
+            callback_data=f"{STOP_BROADCAST_PREFIX}{job_id}",
+        )
+    )
+
+    progress_message = await waiting_msg.edit_text(
+        f"Рассылка `{job_id}` запущена.\n"
+        f"Лимит: {limit or 'все'} пользователей\n"
+        f"Интервал: {interval} c.",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+    await poll_broadcast_status(progress_message, job_id, keyboard)
+
+
+async def poll_broadcast_status(
+    progress_message: types.Message,
+    job_id: str,
+    keyboard: types.InlineKeyboardMarkup,
+):
+    while True:
+        await asyncio.sleep(5)
+        try:
+            response, data = await api_json(
+                "get",
+                "/send_status",
+                params={"job_id": job_id},
+                timeout=20,
+            )
+        except Exception as exc:
+            await progress_message.edit_text(f"Не удалось получить статус рассылки: {exc}")
+            return
+
+        if response.status_code == 404:
+            await progress_message.edit_text("Рассылка не найдена или уже удалена.")
+            return
+
+        if response.status_code != 200 or not isinstance(data, dict):
+            await progress_message.edit_text(
+                f"Ошибка статуса рассылки ({response.status_code}): {response.text}"
+            )
+            return
+
+        status = data.get("status")
+        processed = data.get("processed", 0)
+        total = data.get("total", 0)
+        sent_success = data.get("sent_success", 0)
+        sent_failed = data.get("sent_failed", 0)
+        message_text = data.get("message") or ""
+
+        status_text = (
+            f"Рассылка `{job_id}` — *{status}*\n"
+            f"Всего получателей: {total}\n"
+            f"Обработано: {processed}\n"
+            f"Успешно: {sent_success}\n"
+            f"С ошибкой: {sent_failed}"
+        )
+        if message_text:
+            status_text += f"\n\n{message_text}"
+
+        reply_markup = keyboard if status == "running" else None
+
+        try:
+            await progress_message.edit_text(
+                status_text,
+                parse_mode="Markdown",
+                reply_markup=reply_markup,
+            )
+        except MessageNotModified:
+            pass
+
+        if status in {"done", "error", "cancelled"}:
+            return
 
 
 @dp.message_handler(commands=["start"])
@@ -137,10 +250,57 @@ async def cmd_exports(message: types.Message):
     await message.answer("Выбери файл для скачивания:", reply_markup=keyboard)
 
 
+@dp.message_handler(commands=["broadcast"])
+async def cmd_broadcast(message: types.Message):
+    user_id = message.from_user.id
+    broadcast_states[user_id] = {"step": "waiting_text"}
+    await message.answer(
+        "Введите текст сообщения для рассылки:\n"
+        "Рассылка пойдёт только тем пользователям, кому ещё не отправляли ранее."
+    )
+
+
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
+    broadcast_state = broadcast_states.get(user_id)
+
+    if broadcast_state:
+        step = broadcast_state.get("step")
+        if step == "waiting_text":
+            broadcast_state["text"] = message.text
+            broadcast_state["step"] = "waiting_limit"
+            await message.answer("Сколько пользователей обработать? Введите число или `all`.", parse_mode="Markdown")
+            return
+        if step == "waiting_limit":
+            limit_text = message.text.strip().lower()
+            if limit_text in ("all", "все"):
+                broadcast_state["limit"] = None
+            else:
+                try:
+                    limit_value = int(limit_text)
+                    if limit_value <= 0:
+                        raise ValueError
+                    broadcast_state["limit"] = limit_value
+                except ValueError:
+                    await message.answer("Нужно указать положительное число или `all`.", parse_mode="Markdown")
+                    return
+            broadcast_state["step"] = "waiting_interval"
+            await message.answer("Введите интервал между сообщениями в секундах (можно 0).")
+            return
+        if step == "waiting_interval":
+            try:
+                interval_value = float(message.text.strip().replace(",", "."))
+                if interval_value < 0:
+                    raise ValueError
+            except ValueError:
+                await message.answer("Интервал должен быть числом 0 или больше.")
+                return
+            broadcast_state["interval"] = interval_value
+            await start_broadcast(message, user_id, broadcast_state)
+            broadcast_states.pop(user_id, None)
+            return
 
     # если мы ждем от этого юзера ссылку для скрапа
     if state == "waiting_for_chat":
@@ -394,6 +554,36 @@ async def handle_full_export(callback_query: types.CallbackQuery):
         types.InputFile(csv_bytes),
         caption="Полный экспорт всех участников.",
     )
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(STOP_BROADCAST_PREFIX))
+async def handle_stop_broadcast(callback_query: types.CallbackQuery):
+    job_id = callback_query.data[len(STOP_BROADCAST_PREFIX) :]
+    await callback_query.answer("Останавливаю рассылку...")
+
+    try:
+        response, data = await api_json(
+            "post",
+            "/send_stop",
+            params={"job_id": job_id},
+            timeout=20,
+        )
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось остановить рассылку: {exc}")
+        return
+
+    if response.status_code == 404:
+        await callback_query.message.answer("Рассылка уже завершена или не найдена.")
+        return
+
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка остановки ({response.status_code}): {response.text}"
+        )
+        return
+
+    status_msg = (data or {}).get("status", "unknown") if isinstance(data, dict) else "unknown"
+    await callback_query.message.answer(f"Статус остановки для `{job_id}`: {status_msg}", parse_mode="Markdown")
 
 
 if __name__ == "__main__":
