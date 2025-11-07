@@ -45,6 +45,7 @@ async def api_json(method: str, endpoint: str, **kwargs):
 
 
 CALLBACK_PREFIX = "download:"
+CLEAR_EXPORTS_CALLBACK = "clear_exports"
 export_tokens: Dict[str, str] = {}
 
 
@@ -124,6 +125,13 @@ async def cmd_exports(message: types.Message):
     if buttons_added == 0:
         await message.answer("Готовых CSV пока нет. Создай новую задачу через /scrape.")
         return
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            text="Очистить список",
+            callback_data=CLEAR_EXPORTS_CALLBACK,
+        )
+    )
 
     await message.answer("Выбери файл для скачивания:", reply_markup=keyboard)
 
@@ -271,9 +279,11 @@ async def handle_text(message: types.Message):
         csv_bytes = io.BytesIO(csv_response.content)
         csv_bytes.name = filename
 
+        processed_count = status_data.get("processed", processed)
         caption = (
             f"Готово ✅\n"
             f"Чат: `{chat_ref}`\n"
+            f"Получено записей: *{processed_count}*\n"
             f"Уникальных участников: *{total}*.\n\n"
             "Файл добавлен в общий список /exports."
         )
@@ -327,6 +337,30 @@ async def handle_export_download(callback_query: types.CallbackQuery):
         callback_query.from_user.id,
         types.InputFile(csv_bytes),
         caption=f"Экспорт {filename}",
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == CLEAR_EXPORTS_CALLBACK)
+async def handle_clear_exports(callback_query: types.CallbackQuery):
+    await callback_query.answer("Очищаю список…")
+
+    try:
+        response, data = await api_json("post", "/scrape_exports/clear", timeout=60)
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось очистить список: {exc}")
+        return
+
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка при очистке ({response.status_code}): {response.text}"
+        )
+        return
+
+    export_tokens.clear()
+
+    deleted = (data or {}).get("deleted", 0) if isinstance(data, dict) else 0
+    await callback_query.message.edit_text(
+        f"Список экспортов очищен. Удалено файлов: {deleted}."
     )
 
 
