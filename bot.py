@@ -129,12 +129,6 @@ async def cmd_exports(message: types.Message):
 
     keyboard.add(
         types.InlineKeyboardButton(
-            text="Очистить список",
-            callback_data=CLEAR_EXPORTS_CALLBACK,
-        )
-    )
-    keyboard.add(
-        types.InlineKeyboardButton(
             text="Скачать всю БД CSV",
             callback_data=FULL_EXPORT_CALLBACK,
         )
