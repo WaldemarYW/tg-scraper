@@ -53,6 +53,7 @@ jobs_lock = asyncio.Lock()
 broadcast_lock = asyncio.Lock()
 BROADCAST_JOBS: Dict[str, Dict[str, Any]] = {}
 current_broadcast_job_id: Optional[str] = None
+current_scrape_job_id: Optional[str] = None
 
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 
@@ -495,6 +496,7 @@ async def _write_full_export() -> str:
 
 
 async def scrape_users(job_id: str, chat_value: str) -> None:
+    global current_scrape_job_id
     processed_total = 0
     newly_saved = 0
     csv_path = ""
@@ -509,7 +511,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             async with db_lock:
                 existing_ids = await asyncio.to_thread(_fetch_existing_ids_sync, db_conn)
 
-            await _update_job(job_id, total=0, processed=0)
+            await _update_job(job_id, total=0, processed=0, cancel_requested=False)
 
             entity = await client.get_entity(chat_value)
             chat_title = _derive_chat_title(entity, chat_value)
@@ -519,6 +521,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             csv_filename = f"members_{safe_title}.csv"
             csv_path = os.path.join(CSV_OUTPUT_DIR, csv_filename)
             await _update_job(job_id, chat_title=chat_title, source_chat=source_chat_identifier)
+            current_scrape_job_id = job_id
 
             logger.info(
                 "Starting scrape job %s for %s. Already have %d members.",
@@ -545,6 +548,10 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                     raise RuntimeError(f"Error: {e}") from e
 
                 processed_total += 1
+                current_job = SCRAPE_JOBS.get(job_id, {})
+                if current_job.get("cancel_requested"):
+                    logger.info("Scrape job %s cancellation requested. Stopping.", job_id)
+                    break
                 is_new = user.id not in existing_ids
                 member = Member(
                     id=user.id,
@@ -705,14 +712,17 @@ async def broadcast_users(job_id: str, text: str, interval: float, recipients: L
             if interval > 0:
                 await asyncio.sleep(interval)
 
-        status_value = "cancelled" if job.get("cancel_requested") else "done"
-        await _update_broadcast_job(
+        status_value = (
+            "cancelled"
+            if SCRAPE_JOBS.get(job_id, {}).get("cancel_requested")
+            else "done"
+        )
+        await _update_job(
             job_id,
             status=status_value,
             finished_at=_current_iso(),
-            processed=processed,
-            sent_success=sent_success,
-            sent_failed=sent_failed,
+            total=len(job_members),
+            processed=processed_total,
         )
     except Exception as exc:
         await _update_broadcast_job(
@@ -884,6 +894,19 @@ async def scrape_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     return JobStatusResponse(job_id=job_id, **job)
+
+
+@app.post("/scrape_stop")
+async def scrape_stop(job_id: str):
+    async with jobs_lock:
+        job = SCRAPE_JOBS.get(job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        if job.get("status") in {"done", "error", "cancelled"}:
+            return {"status": job.get("status"), "message": "Job already finished."}
+        job["cancel_requested"] = True
+        job["message"] = "Cancellation requested by user."
+    return {"status": "cancelling"}
 
 
 @app.post("/send_start", response_model=BroadcastJobResponse, status_code=202)

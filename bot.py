@@ -4,11 +4,11 @@ import os
 import io
 import logging
 import uuid
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 
 import requests
 from aiogram import Bot, Dispatcher, executor, types
-from aiogram.utils.exceptions import MessageNotModified
+from aiogram.utils.exceptions import MessageNotModified, MessageToDeleteNotFound
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -51,16 +51,29 @@ FULL_EXPORT_CALLBACK = "download_full"
 STOP_BROADCAST_PREFIX = "stop_broadcast:"
 BROADCAST_INFO_PREFIX = "broadcast_info:"
 export_tokens: Dict[str, str] = {}
+current_scrape_job_id: Optional[str] = None
 
 MAIN_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
 MAIN_KEYBOARD.row(
-    types.KeyboardButton("/scrape"),
-    types.KeyboardButton("/exports"),
+    types.KeyboardButton("Сбор"),
+    types.KeyboardButton("Экспорты"),
 )
 MAIN_KEYBOARD.row(
-    types.KeyboardButton("/broadcast"),
+    types.KeyboardButton("Рассылка"),
     types.KeyboardButton("Статистика по дням"),
 )
+
+SCRAPE_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
+SCRAPE_KEYBOARD.row(types.KeyboardButton("/scrape"))
+SCRAPE_KEYBOARD.row(types.KeyboardButton("Остановить сбор"), types.KeyboardButton("Назад"))
+
+EXPORTS_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
+EXPORTS_KEYBOARD.row(types.KeyboardButton("/exports"))
+EXPORTS_KEYBOARD.row(types.KeyboardButton("Назад"))
+
+BROADCAST_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
+BROADCAST_KEYBOARD.row(types.KeyboardButton("/broadcast"))
+BROADCAST_KEYBOARD.row(types.KeyboardButton("Назад"))
 
 
 def _format_log_entries(entries):
@@ -255,6 +268,11 @@ async def cmd_start(message: types.Message):
     await message.answer(text, reply_markup=MAIN_KEYBOARD)
 
 
+@dp.message_handler(lambda m: m.text == "Сбор")
+async def handle_main_scrape_menu(message: types.Message):
+    await message.answer("Меню сбора:", reply_markup=SCRAPE_KEYBOARD)
+
+
 @dp.message_handler(commands=["scrape"])
 async def cmd_scrape(message: types.Message):
     user_id = message.from_user.id
@@ -269,7 +287,7 @@ async def cmd_scrape(message: types.Message):
         "`@testgroup`\n\n"
         "Я запущу задачу на сбор всех доступных участников и пришлю CSV, когда она завершится."
     )
-    await message.answer(text, parse_mode="Markdown", reply_markup=MAIN_KEYBOARD)
+    await message.answer(text, parse_mode="Markdown", reply_markup=SCRAPE_KEYBOARD)
 
 
 @dp.message_handler(commands=["exports"])
@@ -432,11 +450,59 @@ async def handle_stats_button_text(message: types.Message):
     await send_broadcast_stats_message(message)
 
 
+@dp.message_handler(lambda m: m.text == "Экспорты")
+async def handle_main_exports_menu(message: types.Message):
+    await message.answer("Меню экспортов:", reply_markup=EXPORTS_KEYBOARD)
+    await cmd_exports(message)
+
+
+@dp.message_handler(lambda m: m.text == "Рассылка")
+async def handle_main_broadcast_menu(message: types.Message):
+    await message.answer("Меню рассылок:", reply_markup=BROADCAST_KEYBOARD)
+    await cmd_broadcast(message)
+
+
+@dp.message_handler(lambda m: m.text == "Назад")
+async def handle_back_to_main(message: types.Message):
+    await message.answer("Возврат в главное меню.", reply_markup=MAIN_KEYBOARD)
+
+
+@dp.message_handler(lambda m: m.text == "Остановить сбор")
+async def handle_stop_scrape_text(message: types.Message):
+    global current_scrape_job_id
+    if not current_scrape_job_id:
+        await message.answer("Сейчас нет активного сбора.", reply_markup=SCRAPE_KEYBOARD)
+        return
+    try:
+        response, data = await api_json(
+            "post",
+            "/scrape_stop",
+            params={"job_id": current_scrape_job_id},
+            timeout=20,
+        )
+    except Exception as exc:
+        await message.answer(f"Не удалось остановить сбор: {exc}", reply_markup=SCRAPE_KEYBOARD)
+        return
+
+    if response.status_code != 200 or not isinstance(data, dict):
+        await message.answer(
+            f"Ошибка остановки ({response.status_code}): {response.text}",
+            reply_markup=SCRAPE_KEYBOARD,
+        )
+        return
+
+    status = data.get("status", "unknown")
+    await message.answer(f"Сбор {current_scrape_job_id} остановлен: {status}", reply_markup=SCRAPE_KEYBOARD)
+    if status in {"cancelling", "cancelled"}:
+        current_scrape_job_id = None
+
+
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
     broadcast_state = broadcast_states.get(user_id)
+    global current_scrape_job_id
 
     if broadcast_state:
         step = broadcast_state.get("step")
@@ -507,6 +573,7 @@ async def handle_text(message: types.Message):
         if not job_id:
             await awaiting_msg.edit_text("Скрапер не вернул идентификатор задачи 😕")
             return
+        current_scrape_job_id = job_id
 
         await awaiting_msg.edit_text(
             f"Задача `{job_id}` запущена.\n"
@@ -871,8 +938,8 @@ async def handle_broadcast_info(callback_query: types.CallbackQuery):
         )
 
     await callback_query.message.answer(
-        f"Последние записи рассылки `{job_id}`:\n{text}",
-        parse_mode="Markdown",
+        f"Последние записи рассылки {job_id}:\n{text}",
+        parse_mode=None,
         reply_markup=reply_markup,
     )
     await callback_query.answer()
