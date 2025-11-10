@@ -1,6 +1,7 @@
 # scraper_service.py
 import asyncio
 import csv
+import json
 import logging
 import os
 import re
@@ -73,6 +74,7 @@ class Member(BaseModel):
     last_broadcast_at: Optional[str] = None
     last_broadcast_status: Optional[str] = None
     is_hr: bool = False
+    source_chat: Optional[str] = None
 
 
 class JobResponse(BaseModel):
@@ -97,17 +99,22 @@ class CSVExport(BaseModel):
     job_id: Optional[str]
     created_at: Optional[str]
     url: str
+    chat_title: Optional[str] = None
+    source_chat: Optional[str] = None
 
 
 class BroadcastRequest(BaseModel):
     text: str
     limit: Optional[int] = None
     interval_seconds: float = 0.0
+    source_chat: Optional[str] = None
+    chat_title: Optional[str] = None
 
 
 class BroadcastJobResponse(BaseModel):
     job_id: str
     status: str
+    source_chat: Optional[str] = None
 
 
 class BroadcastStatusResponse(BaseModel):
@@ -121,6 +128,8 @@ class BroadcastStatusResponse(BaseModel):
     finished_at: Optional[str] = None
     cancel_requested: bool
     message: Optional[str] = None
+    source_chat: Optional[str] = None
+    chat_title: Optional[str] = None
 
 
 class BroadcastLogEntry(BaseModel):
@@ -136,6 +145,7 @@ class BroadcastLogResponse(BaseModel):
     total: int
     next_offset: Optional[int]
     has_more: bool
+    source_chat: Optional[str] = None
 
 
 class BroadcastStatsEntry(BaseModel):
@@ -175,6 +185,8 @@ def _ensure_member_columns(conn: sqlite3.Connection) -> None:
                 THEN 1 ELSE 0 END
             """
         )
+    if "source_chat" not in existing:
+        conn.execute("ALTER TABLE members ADD COLUMN source_chat TEXT")
     conn.commit()
 
 
@@ -244,6 +256,17 @@ def _write_members_csv(members: List[Member], csv_path: str) -> None:
             )
 
 
+def _write_export_metadata(csv_path: str, chat_title: str, source_chat: str) -> None:
+    meta = {
+        "chat_title": chat_title,
+        "source_chat": source_chat,
+        "generated_at": _current_iso(),
+    }
+    meta_path = f"{csv_path}.meta.json"
+    with open(meta_path, "w", encoding="utf-8") as meta_file:
+        json.dump(meta, meta_file, ensure_ascii=False, indent=2)
+
+
 def _safe_filename_component(value: str) -> str:
     cleaned = FILENAME_SANITIZE_RE.sub("_", value.strip())
     cleaned = cleaned.strip("._-")
@@ -303,12 +326,31 @@ def _list_csv_exports() -> List[CSVExport]:
         file_path = os.path.abspath(entry.path)
         job_id = job_map.get(file_path)
         created_at = datetime.utcfromtimestamp(entry.stat().st_mtime).isoformat()
+        chat_title = None
+        source_chat = None
+
+        meta_path = f"{file_path}.meta.json"
+        if os.path.exists(meta_path):
+            try:
+                with open(meta_path, "r", encoding="utf-8") as meta_file:
+                    meta = json.load(meta_file)
+                    chat_title = meta.get("chat_title")
+                    source_chat = meta.get("source_chat")
+            except (json.JSONDecodeError, OSError):
+                pass
+        if not chat_title and job_id:
+            job = SCRAPE_JOBS.get(job_id, {})
+            chat_title = job.get("chat_title")
+            source_chat = source_chat or job.get("source_chat")
+
         exports.append(
             CSVExport(
                 filename=entry.name,
                 job_id=job_id,
                 created_at=created_at,
                 url=f"/scrape_export/{entry.name}",
+                chat_title=chat_title,
+                source_chat=source_chat,
             )
         )
     return exports
@@ -331,17 +373,22 @@ def _clear_csv_exports() -> int:
 
 
 def _fetch_pending_broadcast_members_sync(
-    conn: sqlite3.Connection, limit: Optional[int]
+    conn: sqlite3.Connection, limit: Optional[int], source_chat: Optional[str]
 ) -> List[Member]:
     query = """
-        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0)
+        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0), source_chat
         FROM members
         WHERE last_broadcast_at IS NULL AND IFNULL(is_hr, 0) = 0
-        ORDER BY added_at ASC
     """
+    params: List[Any] = []
+    if source_chat:
+        query += " AND source_chat = ?"
+        params.append(source_chat)
+
+    query += " ORDER BY added_at ASC"
     if limit is not None and limit > 0:
         query += f" LIMIT {int(limit)}"
-    cursor = conn.execute(query)
+    cursor = conn.execute(query, tuple(params))
     rows = cursor.fetchall()
     return [
         Member(
@@ -354,6 +401,7 @@ def _fetch_pending_broadcast_members_sync(
             last_broadcast_at=row[6],
             last_broadcast_status=row[7],
             is_hr=bool(row[8]),
+            source_chat=row[9],
         )
         for row in rows
     ]
@@ -466,10 +514,11 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
             entity = await client.get_entity(chat_value)
             chat_title = _derive_chat_title(entity, chat_value)
             fallback_name = _fallback_from_chat_value(chat_value)
+            source_chat_identifier = fallback_name or chat_title or chat_value
             safe_title = _safe_filename_component(chat_title) or _safe_filename_component(fallback_name) or f"job_{job_id}"
             csv_filename = f"members_{safe_title}.csv"
             csv_path = os.path.join(CSV_OUTPUT_DIR, csv_filename)
-            await _update_job(job_id, chat_title=chat_title)
+            await _update_job(job_id, chat_title=chat_title, source_chat=source_chat_identifier)
 
             logger.info(
                 "Starting scrape job %s for %s. Already have %d members.",
@@ -505,6 +554,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                     phone=user.phone,
                     added_at=datetime.utcnow().isoformat(),
                     is_hr=_is_hr_candidate(user.username, user.first_name, user.last_name),
+                    source_chat=source_chat_identifier,
                 )
 
                 if is_new:
@@ -547,6 +597,7 @@ async def scrape_users(job_id: str, chat_value: str) -> None:
                 )
 
             await asyncio.to_thread(_write_members_csv, job_members, csv_path)
+            await asyncio.to_thread(_write_export_metadata, csv_path, chat_title, source_chat_identifier)
 
             logger.info(
                 "Scrape finished for %s. Added %d new members in this run (processed %d records).",
@@ -690,7 +741,8 @@ def init_db() -> sqlite3.Connection:
             added_at TEXT NOT NULL,
             last_broadcast_at TEXT,
             last_broadcast_status TEXT,
-            is_hr INTEGER DEFAULT 0
+            is_hr INTEGER DEFAULT 0,
+            source_chat TEXT
         )
         """
     )
@@ -717,15 +769,17 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
             added_at,
             last_broadcast_at,
             last_broadcast_status,
-            is_hr
+            is_hr,
+            source_chat
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(id) DO UPDATE SET
             username = excluded.username,
             first_name = excluded.first_name,
             last_name = excluded.last_name,
             phone = excluded.phone,
-            is_hr = excluded.is_hr
+            is_hr = excluded.is_hr,
+            source_chat = COALESCE(excluded.source_chat, members.source_chat)
         """,
         (
             member.id,
@@ -737,6 +791,7 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
             member.last_broadcast_at,
             member.last_broadcast_status,
             int(member.is_hr),
+            member.source_chat,
         ),
     )
     conn.commit()
@@ -745,7 +800,7 @@ def _insert_member_sync(conn: sqlite3.Connection, member: Member) -> None:
 def _fetch_all_members_sync(conn: sqlite3.Connection) -> List[Member]:
     cursor = conn.execute(
         """
-        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0)
+        SELECT id, username, first_name, last_name, phone, added_at, last_broadcast_at, last_broadcast_status, IFNULL(is_hr, 0), source_chat
         FROM members
         ORDER BY added_at ASC
         """
@@ -762,6 +817,7 @@ def _fetch_all_members_sync(conn: sqlite3.Connection) -> List[Member]:
             last_broadcast_at=row[6],
             last_broadcast_status=row[7],
             is_hr=bool(row[8]),
+            source_chat=row[9],
         )
         for row in rows
     ]
@@ -842,12 +898,14 @@ async def send_start(req: BroadcastRequest):
 
     limit = req.limit if req.limit and req.limit > 0 else None
     interval = max(0.0, req.interval_seconds or 0.0)
+    source_chat = (req.source_chat or "").strip() or None
 
     async with db_lock:
         recipients = await asyncio.to_thread(
             _fetch_pending_broadcast_members_sync,
             db_conn,
             limit,
+            source_chat,
         )
 
     if not recipients:
@@ -870,6 +928,8 @@ async def send_start(req: BroadcastRequest):
             "sent_failed": 0,
             "limit": limit,
             "interval": interval,
+            "source_chat": source_chat,
+            "chat_title": req.chat_title,
             "started_at": _current_iso(),
             "finished_at": None,
             "cancel_requested": False,
@@ -881,7 +941,7 @@ async def send_start(req: BroadcastRequest):
     async with broadcast_lock:
         BROADCAST_JOBS[job_id]["task"] = task
 
-    return BroadcastJobResponse(job_id=job_id, status="started")
+    return BroadcastJobResponse(job_id=job_id, status="started", source_chat=source_chat)
 
 
 @app.post("/send_stop")
@@ -914,6 +974,8 @@ async def send_status(job_id: str):
         finished_at=job.get("finished_at"),
         cancel_requested=job.get("cancel_requested", False),
         message=job.get("message"),
+        source_chat=job.get("source_chat"),
+        chat_title=job.get("chat_title"),
     )
 
 
@@ -953,6 +1015,7 @@ async def send_log(job_id: str, offset: int = 0, limit: int = 10):
         total=total,
         next_offset=next_offset if has_more else None,
         has_more=has_more,
+        source_chat=BROADCAST_JOBS.get(job_id, {}).get("source_chat"),
     )
 
 

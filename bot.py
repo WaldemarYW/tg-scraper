@@ -4,7 +4,7 @@ import os
 import io
 import logging
 import uuid
-from typing import Dict, Any
+from typing import Dict, Any, List, Tuple
 
 import requests
 from aiogram import Bot, Dispatcher, executor, types
@@ -110,6 +110,10 @@ async def send_broadcast_stats_message(message: types.Message):
 
 
 async def start_broadcast(message: types.Message, user_id: int, settings: Dict[str, Any]):
+    source_chat = settings.get("source_chat")
+    if not source_chat:
+        await message.answer("Не выбран чат для рассылки. Запусти /broadcast заново.", reply_markup=MAIN_KEYBOARD)
+        return
     text = settings.get("text", "").strip()
     limit = settings.get("limit")
     interval = settings.get("interval", 0.0)
@@ -124,6 +128,8 @@ async def start_broadcast(message: types.Message, user_id: int, settings: Dict[s
                 "text": text,
                 "limit": limit,
                 "interval_seconds": interval,
+                "source_chat": settings.get("source_chat"),
+                "chat_title": settings.get("chat_title"),
             },
             timeout=30,
         )
@@ -157,7 +163,8 @@ async def start_broadcast(message: types.Message, user_id: int, settings: Dict[s
     progress_message = await waiting_msg.edit_text(
         f"Рассылка `{job_id}` запущена.\n"
         f"Лимит: {limit or 'все'} пользователей\n"
-        f"Интервал: {interval} c.",
+        f"Интервал: {interval} c.\n"
+        f"Чат: {settings.get('chat_title') or settings.get('source_chat') or 'не указан'}",
         parse_mode="Markdown",
         reply_markup=keyboard,
     )
@@ -199,9 +206,11 @@ async def poll_broadcast_status(
         sent_success = data.get("sent_success", 0)
         sent_failed = data.get("sent_failed", 0)
         message_text = data.get("message") or ""
+        chat_display = data.get("chat_title") or data.get("source_chat") or "не указан"
 
         status_text = (
             f"Рассылка `{job_id}` — *{status}*\n"
+            f"Чат: {chat_display}\n"
             f"Всего получателей: {total}\n"
             f"Обработано: {processed}\n"
             f"Успешно: {sent_success}\n"
@@ -319,6 +328,12 @@ async def cmd_exports(message: types.Message):
 
     keyboard.add(
         types.InlineKeyboardButton(
+            text="Очистить список",
+            callback_data=CLEAR_EXPORTS_CALLBACK,
+        )
+    )
+    keyboard.add(
+        types.InlineKeyboardButton(
             text="Скачать всю БД CSV",
             callback_data=FULL_EXPORT_CALLBACK,
         )
@@ -330,10 +345,80 @@ async def cmd_exports(message: types.Message):
 @dp.message_handler(commands=["broadcast"])
 async def cmd_broadcast(message: types.Message):
     user_id = message.from_user.id
-    broadcast_states[user_id] = {"step": "waiting_text"}
-    await message.answer(
-        "Введите текст сообщения для рассылки:\n"
-        "Рассылка пойдёт только тем пользователям, кому ещё не отправляли ранее."
+    broadcast_states[user_id] = {"step": "waiting_chat"}
+
+    try:
+        response, data = await api_json("get", "/scrape_exports", timeout=20)
+    except Exception as exc:
+        await message.answer(f"Не удалось получить список экспортов: {exc}", reply_markup=MAIN_KEYBOARD)
+        broadcast_states.pop(user_id, None)
+        return
+
+    if response.status_code != 200 or not isinstance(data, list):
+        await message.answer(
+            f"Ошибка при получении экспортов ({response.status_code}): {response.text}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        broadcast_states.pop(user_id, None)
+        return
+
+    chats = []
+    for export in data:
+        filename = export.get("filename")
+        if not filename:
+            continue
+        chat_title = export.get("chat_title") or filename
+        source_chat = export.get("source_chat")
+        chats.append({"filename": filename, "chat_title": chat_title, "source_chat": source_chat})
+
+    if not chats:
+        await message.answer("Нет доступных экспортов. Сначала собери участников через /scrape.", reply_markup=MAIN_KEYBOARD)
+        broadcast_states.pop(user_id, None)
+        return
+
+    broadcast_states[user_id]["chats"] = chats
+    broadcast_states[user_id]["chat_offset"] = 0
+
+    await send_chat_selection(message, user_id)
+
+
+async def send_chat_selection(target_message: types.Message, user_id: int):
+    state = broadcast_states.get(user_id)
+    if not state:
+        return
+
+    chats: List[Dict[str, Any]] = state.get("chats", [])
+    offset = state.get("chat_offset", 0)
+    page = chats[offset : offset + 5]
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for idx, chat in enumerate(page, start=offset):
+        title = chat.get("chat_title") or chat.get("filename")
+        keyboard.add(
+            types.InlineKeyboardButton(
+                text=title,
+                callback_data=f"broadcast_select:{idx}",
+            )
+        )
+
+    nav_buttons = []
+    if offset > 0:
+        nav_buttons.append(
+            types.InlineKeyboardButton("⟵ Назад", callback_data="broadcast_prev")
+        )
+    if offset + 5 < len(chats):
+        nav_buttons.append(
+            types.InlineKeyboardButton("Далее ⟶", callback_data="broadcast_next")
+        )
+    if nav_buttons:
+        keyboard.row(*nav_buttons)
+
+    keyboard.add(
+        types.InlineKeyboardButton("Отмена", callback_data="broadcast_cancel")
+    )
+
+    await target_message.answer(
+        "Выбери экспорт/чат для рассылки:", reply_markup=keyboard
     )
 
 
@@ -355,6 +440,9 @@ async def handle_text(message: types.Message):
 
     if broadcast_state:
         step = broadcast_state.get("step")
+        if step == "waiting_chat":
+            await message.answer("Сначала выбери чат из списка выше.", reply_markup=MAIN_KEYBOARD)
+            return
         if step == "waiting_text":
             broadcast_state["text"] = message.text
             broadcast_state["step"] = "waiting_limit"
@@ -640,6 +728,72 @@ async def handle_full_export(callback_query: types.CallbackQuery):
         callback_query.from_user.id,
         types.InputFile(csv_bytes),
         caption="Полный экспорт всех участников.",
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "broadcast_prev")
+async def handle_broadcast_prev(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    state = broadcast_states.get(user_id)
+    if not state:
+        await callback_query.answer("Сессия рассылки не найдена.", show_alert=True)
+        return
+    offset = max(0, state.get("chat_offset", 0) - 5)
+    state["chat_offset"] = offset
+    await callback_query.answer()
+    await send_chat_selection(callback_query.message, user_id)
+
+
+@dp.callback_query_handler(lambda c: c.data == "broadcast_next")
+async def handle_broadcast_next(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    state = broadcast_states.get(user_id)
+    if not state:
+        await callback_query.answer("Сессия рассылки не найдена.", show_alert=True)
+        return
+    offset = state.get("chat_offset", 0) + 5
+    if offset >= len(state.get("chats", [])):
+        offset = state.get("chat_offset", 0)
+    state["chat_offset"] = offset
+    await callback_query.answer()
+    await send_chat_selection(callback_query.message, user_id)
+
+
+@dp.callback_query_handler(lambda c: c.data == "broadcast_cancel")
+async def handle_broadcast_cancel(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    broadcast_states.pop(user_id, None)
+    await callback_query.answer("Рассылка отменена.")
+    await callback_query.message.edit_text("Выбор рассылки отменён.", reply_markup=None)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("broadcast_select:"))
+async def handle_broadcast_select(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    state = broadcast_states.get(user_id)
+    if not state:
+        await callback_query.answer("Сессия рассылки не найдена.", show_alert=True)
+        return
+    try:
+        index = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        await callback_query.answer("Некорректный выбор.", show_alert=True)
+        return
+    chats = state.get("chats", [])
+    if index < 0 or index >= len(chats):
+        await callback_query.answer("Чат не найден.", show_alert=True)
+        return
+    selected = chats[index]
+    source_chat = selected.get("source_chat") or selected.get("chat_title") or selected.get("filename")
+    chat_title = selected.get("chat_title") or selected.get("filename")
+
+    state["source_chat"] = source_chat
+    state["chat_title"] = chat_title
+    state["step"] = "waiting_text"
+
+    await callback_query.message.edit_text(
+        f"Выбран чат: {chat_title}\n\nТеперь введите текст рассылки:",
+        reply_markup=None,
     )
 
 
