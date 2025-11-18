@@ -4,6 +4,7 @@ import os
 import io
 import logging
 import uuid
+import html
 from typing import Dict, Any, List, Tuple, Optional
 
 import requests
@@ -150,6 +151,25 @@ def _parse_time_string(value: str) -> Optional[Tuple[int, int]]:
     return None
 
 
+def _safe_text(value: Optional[str]) -> str:
+    return html.escape(value or "")
+
+
+def _format_group_link(title: Optional[str], link: Optional[str]) -> str:
+    display = title or link or "Без названия"
+    safe_display = html.escape(display)
+    if link:
+        if link.startswith("https://"):
+            safe_link = html.escape(link, quote=True)
+        elif link.startswith("@"):
+            safe_link = html.escape(f"https://t.me/{link.lstrip('@')}", quote=True)
+        else:
+            safe_link = None
+        if safe_link:
+            return f'<a href="{safe_link}">{safe_display}</a>'
+    return safe_display
+
+
 async def _respond_with_markup(
     target_message: types.Message,
     text: str,
@@ -200,7 +220,7 @@ async def send_promo_groups_view(target_message: types.Message, *, edit: bool = 
         )
         return
 
-    folder_label = PROMO_FOLDER_NAME or "папки"
+    folder_label = html.escape(PROMO_FOLDER_NAME or "папки")
     header = (
         f"Группы берутся автоматически из папки '{folder_label}'.\n"
         "Добавь нужные чаты в эту папку в Telegram, и бот подхватит их сам."
@@ -210,19 +230,19 @@ async def send_promo_groups_view(target_message: types.Message, *, edit: bool = 
     else:
         lines = [header, "", "Список групп:"]
         for group in data:
-            title = group.get("title") or "Без названия"
-            link_value = group.get("link") or "—"
-            if link_value.startswith("https://t.me/"):
-                link_value = "@" + link_value.rsplit("/", 1)[-1]
-            status = group.get("last_status") or "—"
-            lines.append(f"#{group['id']}: {title} — {link_value} (последний статус: {status})")
+            title = group.get("title") or group.get("link")
+            link_value = group.get("link")
+            status = html.escape(group.get("last_status") or "—")
+            lines.append(
+                f"#{group['id']}: {_format_group_link(title, link_value)} (последний статус: {status})"
+            )
         text = "\n".join(lines)
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton("🔄 Обновить", callback_data=PROMO_GROUPS_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
 
-    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+    await _respond_with_markup(target_message, text, keyboard, edit=edit, parse_mode="HTML")
 
 
 async def send_promo_messages_view(target_message: types.Message, *, edit: bool = False):
@@ -313,8 +333,9 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
     is_paused = bool(data.get("is_paused"))
     current_slot = data.get("current_slot")
     lines = [
-        f"Статус за {data.get('day')}",
-        "Автоматическая рассылка: " + ("остановлена" if is_paused else "активна"),
+        f"Статус за {_safe_text(data.get('day'))}",
+        "Автоматическая рассылка: "
+        + ("остановлена" if is_paused else "активна"),
         f"Отправлено: {data.get('total_sent', 0)}, с ошибкой: {data.get('total_failed', 0)}",
         "",
         "Текущий слот:",
@@ -324,20 +345,22 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
         slot_code = slot.get("slot")
         label = PROMO_SLOT_LABELS.get(slot_code, slot_code)
         emoji = PROMO_SLOT_EMOJI.get(slot_code, "")
-        slot_lines = [f"{emoji} {label} — {slot.get('scheduled_for')}"]
+        slot_lines = [
+            f"{emoji} {html.escape(label)} — {_safe_text(slot.get('scheduled_for'))}"
+        ]
         entries = slot.get("entries") or []
         if not entries:
             slot_lines.append("   ещё не отправлено")
         else:
             for entry in entries:
-                group_name = entry.get("group_title") or entry.get("link")
-                slot_lines.append(f"{emoji} {group_name}")
+                group_title = entry.get("group_title") or entry.get("link")
+                slot_lines.append(f"{emoji} {_format_group_link(group_title, entry.get('link'))}")
                 sent_time = entry.get("sent_at") or "—"
                 status = entry.get("status") or "unknown"
                 status_icon = "✅" if status == "sent" else "⚠️"
                 msg_id = entry.get("message_id")
-                slot_lines.append(f"   Время (Киев): {sent_time}")
-                slot_lines.append(f"   Статус: {status_icon} {status}")
+                slot_lines.append(f"   Время (Киев): {_safe_text(sent_time)}")
+                slot_lines.append(f"   Статус: {status_icon} {html.escape(status)}")
                 msg_label = msg_id if msg_id else "?"
                 if status == "sent":
                     slot_lines.append(f"   Отправлено сообщение #{msg_label}.")
@@ -345,7 +368,7 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
                     slot_lines.append(f"   Попытка сообщения #{msg_label}.")
                 details = entry.get("details")
                 if details and status != "sent":
-                    slot_lines.append(f"   Детали: {details}")
+                    slot_lines.append(f"   Детали: {_safe_text(details)}")
                 slot_lines.append("")
         slot_blocks[slot_code] = "\n".join(slot_lines).strip()
 
@@ -371,7 +394,7 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
     keyboard.add(types.InlineKeyboardButton("Обновить", callback_data=PROMO_STATUS_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
 
-    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+    await _respond_with_markup(target_message, text, keyboard, edit=edit, parse_mode="HTML")
 
 
 async def send_promo_summary_view(target_message: types.Message, *, edit: bool = False):
@@ -388,21 +411,21 @@ async def send_promo_summary_view(target_message: types.Message, *, edit: bool =
         return
 
     group_summary = data.get("group_summary", [])
-    lines = [f"Итог по группам за {data.get('day')}:"]
+    lines = [f"Итог по группам за {_safe_text(data.get('day'))}:"]
     if not group_summary:
         lines.append("— нет групп")
     else:
         for group in group_summary:
             title = group.get("title") or group.get("link")
             lines.append(
-                f"• {title}: {group.get('sent', 0)} успешно, {group.get('failed', 0)} с ошибкой"
+                f"• {_format_group_link(title, group.get('link'))}: {group.get('sent', 0)} успешно, {group.get('failed', 0)} с ошибкой"
             )
     text = "\n".join(lines)
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton("Назад", callback_data=PROMO_STATUS_CALLBACK))
 
-    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+    await _respond_with_markup(target_message, text, keyboard, edit=edit, parse_mode="HTML")
 
 
 async def send_promo_slots_view(target_message: types.Message, *, edit: bool = False):
@@ -424,20 +447,20 @@ async def send_promo_slots_view(target_message: types.Message, *, edit: bool = F
         slot_code = slot.get("slot")
         label = PROMO_SLOT_LABELS.get(slot_code, slot_code)
         emoji = PROMO_SLOT_EMOJI.get(slot_code, "")
-        lines.append(f"{emoji} {label} — {slot.get('scheduled_for')}")
+        lines.append(f"{emoji} {html.escape(label)} — {_safe_text(slot.get('scheduled_for'))}")
         entries = slot.get("entries") or []
         if not entries:
             lines.append("   ещё не отправлено")
             continue
         for entry in entries:
             group_name = entry.get("group_title") or entry.get("link")
-            lines.append(f"{emoji} {group_name}")
+            lines.append(f"{emoji} {_format_group_link(group_name, entry.get('link'))}")
             sent_time = entry.get("sent_at") or "—"
             status = entry.get("status") or "unknown"
             status_icon = "✅" if status == "sent" else "⚠️"
             msg_id = entry.get("message_id")
-            lines.append(f"   Время (Киев): {sent_time}")
-            lines.append(f"   Статус: {status_icon} {status}")
+            lines.append(f"   Время (Киев): {_safe_text(sent_time)}")
+            lines.append(f"   Статус: {status_icon} {html.escape(status)}")
             msg_label = msg_id if msg_id else "?"
             if status == "sent":
                 lines.append(f"   Отправлено сообщение #{msg_label}.")
@@ -445,14 +468,14 @@ async def send_promo_slots_view(target_message: types.Message, *, edit: bool = F
                 lines.append(f"   Попытка сообщения #{msg_label}.")
             details = entry.get("details")
             if details and status != "sent":
-                lines.append(f"   Детали: {details}")
+                lines.append(f"   Детали: {_safe_text(details)}")
             lines.append("")
     text = "\n".join(lines).strip()
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton("Назад", callback_data=PROMO_STATUS_CALLBACK))
 
-    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+    await _respond_with_markup(target_message, text, keyboard, edit=edit, parse_mode="HTML")
 
 
 async def send_broadcast_stats_message(message: types.Message):
