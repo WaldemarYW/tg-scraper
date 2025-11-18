@@ -15,6 +15,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SCRAPER_API_URL = os.getenv("SCRAPER_API_URL", "http://127.0.0.1:8000").rstrip("/")
+PROMO_FOLDER_NAME = os.getenv("PROMO_FOLDER_NAME", "Бесплатно PR").strip()
 
 logging.basicConfig(level=logging.INFO)
 
@@ -53,8 +54,6 @@ STOP_BROADCAST_PREFIX = "stop_broadcast:"
 BROADCAST_INFO_PREFIX = "broadcast_info:"
 PROMO_MENU_CALLBACK = "promo_menu"
 PROMO_GROUPS_CALLBACK = "promo_groups"
-PROMO_GROUP_ADD_CALLBACK = "promo_group_add"
-PROMO_GROUP_DELETE_PREFIX = "promo_group_del:"
 PROMO_MESSAGES_CALLBACK = "promo_messages"
 PROMO_MESSAGE_ADD_CALLBACK = "promo_message_add"
 PROMO_MESSAGE_DELETE_PREFIX = "promo_message_del:"
@@ -172,7 +171,7 @@ async def send_promo_menu_message(target_message: types.Message, *, edit: bool =
     keyboard.add(types.InlineKeyboardButton("Закрыть", callback_data=PROMO_CLOSE_CALLBACK))
     text = (
         "Меню рекламных рассылок:\n"
-        "• Группы — список ссылок, куда уходит реклама.\n"
+        f"• Группы — автоматически подгружаются из папки '{PROMO_FOLDER_NAME}'.\n"
         "• Сообщения — набор рекламных текстов для рандомного выбора.\n"
         "• Расписание — время отправки утром/днём/вечером."
     )
@@ -192,27 +191,26 @@ async def send_promo_groups_view(target_message: types.Message, *, edit: bool = 
         )
         return
 
+    folder_label = PROMO_FOLDER_NAME or "папки"
+    header = (
+        f"Группы берутся автоматически из папки '{folder_label}'.\n"
+        "Добавь нужные чаты в эту папку в Telegram, и бот подхватит их сам."
+    )
     if not data:
-        text = "Группы для рекламы пока не добавлены."
+        text = header + "\n\nПапка пока пуста."
     else:
-        lines = ["Список групп:"]
+        lines = [header, "", "Список групп:"]
         for group in data:
             title = group.get("title") or "Без названия"
-            link = group.get("link")
-            last_status = group.get("last_status") or "—"
-            lines.append(f"#{group['id']}: {title} — {link} (статус: {last_status})")
+            link_value = group.get("link") or "—"
+            if link_value.startswith("https://t.me/"):
+                link_value = "@" + link_value.rsplit("/", 1)[-1]
+            status = group.get("last_status") or "—"
+            lines.append(f"#{group['id']}: {title} — {link_value} (последний статус: {status})")
         text = "\n".join(lines)
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(types.InlineKeyboardButton("➕ Добавить группу", callback_data=PROMO_GROUP_ADD_CALLBACK))
-    for group in data[:10]:
-        label = _short_label(group.get("title") or group.get("link") or str(group.get("id")))
-        keyboard.add(
-            types.InlineKeyboardButton(
-                f"Удалить {label}",
-                callback_data=f"{PROMO_GROUP_DELETE_PREFIX}{group['id']}",
-            )
-        )
+    keyboard.add(types.InlineKeyboardButton("🔄 Обновить", callback_data=PROMO_GROUPS_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
 
     await _respond_with_markup(target_message, text, keyboard, edit=edit)
@@ -798,38 +796,6 @@ async def handle_promo_status_callback(callback_query: types.CallbackQuery):
     await send_promo_status_view(callback_query.message, edit=True)
 
 
-@dp.callback_query_handler(lambda c: c.data == PROMO_GROUP_ADD_CALLBACK)
-async def handle_promo_group_add_callback(callback_query: types.CallbackQuery):
-    user_id = callback_query.from_user.id
-    promo_states[user_id] = {"mode": "add_group", "step": "awaiting_link"}
-    await callback_query.answer("Введите ссылку")
-    await callback_query.message.answer(
-        "Пришли ссылку или @юзернейм группы, куда надо отправлять рекламу."
-    )
-
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith(PROMO_GROUP_DELETE_PREFIX))
-async def handle_promo_group_delete_callback(callback_query: types.CallbackQuery):
-    await callback_query.answer("Удаляю…")
-    try:
-        group_id = int(callback_query.data[len(PROMO_GROUP_DELETE_PREFIX) :])
-    except ValueError:
-        await callback_query.message.answer("Некорректный идентификатор группы.")
-        return
-    try:
-        response, data = await api_json("delete", f"/promo/groups/{group_id}", timeout=20)
-    except Exception as exc:
-        await callback_query.message.answer(f"Не удалось удалить группу: {exc}")
-        return
-    if response.status_code != 200:
-        await callback_query.message.answer(
-            f"Ошибка удаления группы ({response.status_code}): {response.text}"
-        )
-        return
-    await callback_query.message.answer("Группа удалена ✅")
-    await send_promo_groups_view(callback_query.message, edit=True)
-
-
 @dp.callback_query_handler(lambda c: c.data == PROMO_MESSAGE_ADD_CALLBACK)
 async def handle_promo_message_add_callback(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
@@ -934,37 +900,7 @@ async def handle_text(message: types.Message):
             await message.answer("Действие отменено.", reply_markup=MAIN_KEYBOARD)
             return
         mode = promo_state.get("mode")
-        if mode == "add_group":
-            step = promo_state.get("step", "awaiting_link")
-            if step == "awaiting_link":
-                if not text_value:
-                    await message.answer("Пришли ссылку на группу или @username.")
-                    return
-                promo_state["link"] = text_value
-                promo_state["step"] = "awaiting_title"
-                await message.answer(
-                    "Если хочешь задать название, отправь его. Иначе пришли '-' для пропуска."
-                )
-                return
-            if step == "awaiting_title":
-                title = None if lowered in {"-", "нет", "skip"} else text_value
-                payload = {"link": promo_state.get("link"), "title": title}
-                try:
-                    response, data = await api_json("post", "/promo/groups", json=payload, timeout=20)
-                except Exception as exc:
-                    await message.answer(f"Не удалось сохранить группу: {exc}")
-                    return
-                if response.status_code != 200 or not isinstance(data, dict):
-                    await message.answer(
-                        f"Ошибка при сохранении группы ({response.status_code}): {response.text}"
-                    )
-                    return
-                promo_states.pop(user_id, None)
-                title_display = data.get("title") or data.get("link")
-                await message.answer(f"Группа {title_display} добавлена ✅")
-                await send_promo_groups_view(message)
-                return
-        elif mode == "add_message":
+        if mode == "add_message":
             if not text_value:
                 await message.answer("Текст сообщения не должен быть пустым.")
                 return

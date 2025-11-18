@@ -17,6 +17,8 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, RPCError
+from telethon.tl import functions, types
+from telethon.tl.types import InputPeerChannel, InputPeerChat
 
 load_dotenv()
 
@@ -51,6 +53,8 @@ if PROMO_MIN_DELAY_SECONDS < 0:
     PROMO_MIN_DELAY_SECONDS = 0.0
 if PROMO_MAX_DELAY_SECONDS < PROMO_MIN_DELAY_SECONDS:
     PROMO_MAX_DELAY_SECONDS = PROMO_MIN_DELAY_SECONDS + 1.0
+PROMO_FOLDER_NAME = os.getenv("PROMO_FOLDER_NAME", "Бесплатно PR").strip()
+PROMO_GROUP_SYNC_INTERVAL_SECONDS = int(os.getenv("PROMO_GROUP_SYNC_INTERVAL", 300))
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
@@ -69,6 +73,8 @@ current_scrape_job_id: Optional[str] = None
 promo_scheduler_task: Optional[asyncio.Task] = None
 promo_schedule_event = asyncio.Event()
 promo_slot_last_day: Dict[str, str] = {}
+promo_group_sync_lock = asyncio.Lock()
+promo_last_sync_ts: float = 0.0
 
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 
@@ -177,11 +183,6 @@ class PromoGroupModel(BaseModel):
     added_at: str
     last_sent_at: Optional[str]
     last_status: Optional[str]
-
-
-class PromoGroupCreate(BaseModel):
-    title: Optional[str]
-    link: str
 
 
 class PromoMessageModel(BaseModel):
@@ -302,7 +303,11 @@ def _ensure_promo_tables(conn: sqlite3.Connection) -> None:
             enabled INTEGER NOT NULL DEFAULT 1,
             added_at TEXT NOT NULL,
             last_sent_at TEXT,
-            last_status TEXT
+            last_status TEXT,
+            peer_id INTEGER,
+            peer_type TEXT,
+            access_hash INTEGER,
+            username TEXT
         )
         """
     )
@@ -355,6 +360,23 @@ def _ensure_promo_tables(conn: sqlite3.Connection) -> None:
         """
         CREATE INDEX IF NOT EXISTS idx_promo_history_group
         ON promo_history(group_id, day_key)
+        """
+    )
+    cursor = conn.execute("PRAGMA table_info(promo_groups)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "peer_id" not in columns:
+        conn.execute("ALTER TABLE promo_groups ADD COLUMN peer_id INTEGER")
+    if "peer_type" not in columns:
+        conn.execute("ALTER TABLE promo_groups ADD COLUMN peer_type TEXT")
+    if "access_hash" not in columns:
+        conn.execute("ALTER TABLE promo_groups ADD COLUMN access_hash INTEGER")
+    if "username" not in columns:
+        conn.execute("ALTER TABLE promo_groups ADD COLUMN username TEXT")
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_groups_peer
+        ON promo_groups(peer_id)
+        WHERE peer_id IS NOT NULL
         """
     )
     conn.commit()
@@ -541,7 +563,7 @@ def _clear_csv_exports() -> int:
 def _list_promo_groups_sync(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     cursor = conn.execute(
         """
-        SELECT id, title, link, enabled, added_at, last_sent_at, last_status
+        SELECT id, title, link, enabled, added_at, last_sent_at, last_status, peer_id, peer_type, access_hash, username
         FROM promo_groups
         ORDER BY id ASC
         """
@@ -556,45 +578,13 @@ def _list_promo_groups_sync(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             "added_at": row[4],
             "last_sent_at": row[5],
             "last_status": row[6],
+            "peer_id": row[7],
+            "peer_type": row[8],
+            "access_hash": row[9],
+            "username": row[10],
         }
         for row in rows
     ]
-
-
-def _create_promo_group_sync(conn: sqlite3.Connection, title: Optional[str], link: str) -> Dict[str, Any]:
-    now = _current_iso()
-    conn.execute(
-        """
-        INSERT INTO promo_groups(title, link, enabled, added_at)
-        VALUES(?, ?, 1, ?)
-        """,
-        (title, link, now),
-    )
-    conn.commit()
-    cursor = conn.execute(
-        """
-        SELECT id, title, link, enabled, added_at, last_sent_at, last_status
-        FROM promo_groups
-        WHERE link = ?
-        """,
-        (link,),
-    )
-    row = cursor.fetchone()
-    return {
-        "id": row[0],
-        "title": row[1],
-        "link": row[2],
-        "enabled": bool(row[3]),
-        "added_at": row[4],
-        "last_sent_at": row[5],
-        "last_status": row[6],
-    }
-
-
-def _delete_promo_group_sync(conn: sqlite3.Connection, group_id: int) -> bool:
-    cursor = conn.execute("DELETE FROM promo_groups WHERE id = ?", (group_id,))
-    conn.commit()
-    return cursor.rowcount > 0
 
 
 def _list_promo_messages_sync(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -647,6 +637,196 @@ def _delete_promo_message_sync(conn: sqlite3.Connection, message_id: int) -> boo
     cursor = conn.execute("DELETE FROM promo_messages WHERE id = ?", (message_id,))
     conn.commit()
     return cursor.rowcount > 0
+
+
+def _disable_group_ids(conn: sqlite3.Connection, group_ids: Set[int]) -> None:
+    if not group_ids:
+        return
+    placeholders = ",".join("?" for _ in group_ids)
+    conn.execute(
+        f"UPDATE promo_groups SET enabled = 0 WHERE id IN ({placeholders})",
+        tuple(group_ids),
+    )
+
+
+def _build_group_record_from_entity(entity: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(entity, types.Channel):
+        peer_type = "channel"
+        access_hash = getattr(entity, "access_hash", None)
+    elif isinstance(entity, types.Chat):
+        peer_type = "chat"
+        access_hash = None
+    else:
+        return None
+
+    peer_id = getattr(entity, "id", None)
+    if peer_id is None:
+        return None
+
+    username = getattr(entity, "username", None)
+    link_value = f"https://t.me/{username}" if username else f"id:{peer_id}"
+    title = getattr(entity, "title", None) or username or f"id:{peer_id}"
+
+    return {
+        "peer_id": peer_id,
+        "peer_type": peer_type,
+        "access_hash": access_hash,
+        "username": username,
+        "title": title,
+        "link": link_value,
+    }
+
+
+def _apply_promo_group_records_sync(conn: sqlite3.Connection, records: List[Dict[str, Any]]) -> None:
+    cursor = conn.execute(
+        "SELECT id, peer_id FROM promo_groups WHERE peer_id IS NOT NULL"
+    )
+    existing_map = {row[1]: row[0] for row in cursor.fetchall() if row[1] is not None}
+    managed_ids = set(existing_map.values())
+    seen_ids: Set[int] = set()
+    now = _current_iso()
+
+    for record in records:
+        peer_id = record["peer_id"]
+        row_id = existing_map.get(peer_id)
+        if row_id:
+            conn.execute(
+                """
+                UPDATE promo_groups
+                SET title = ?, link = ?, username = ?, peer_type = ?, access_hash = ?, enabled = 1
+                WHERE id = ?
+                """,
+                (
+                    record["title"],
+                    record["link"],
+                    record["username"],
+                    record["peer_type"],
+                    record["access_hash"],
+                    row_id,
+                ),
+            )
+            seen_ids.add(row_id)
+        else:
+            conn.execute(
+                """
+                INSERT INTO promo_groups(
+                    title,
+                    link,
+                    enabled,
+                    added_at,
+                    last_sent_at,
+                    last_status,
+                    peer_id,
+                    peer_type,
+                    access_hash,
+                    username
+                )
+                VALUES(?, ?, 1, ?, NULL, NULL, ?, ?, ?, ?)
+                """,
+                (
+                    record["title"],
+                    record["link"],
+                    now,
+                    record["peer_id"],
+                    record["peer_type"],
+                    record["access_hash"],
+                    record["username"],
+                ),
+            )
+            new_row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            seen_ids.add(new_row_id)
+
+    missing_ids = managed_ids - seen_ids
+    if missing_ids:
+        _disable_group_ids(conn, missing_ids)
+
+    conn.commit()
+
+
+def _group_to_input_peer(group: Dict[str, Any]) -> Optional[Any]:
+    peer_id = group.get("peer_id")
+    peer_type = group.get("peer_type")
+    if not peer_id or not peer_type:
+        return None
+    if peer_type == "chat":
+        return InputPeerChat(int(peer_id))
+    access_hash = group.get("access_hash")
+    if access_hash is None:
+        return None
+    return InputPeerChannel(int(peer_id), int(access_hash))
+
+
+def _group_display_name(group: Dict[str, Any]) -> str:
+    return (
+        group.get("title")
+        or (group.get("username") and f"@{group['username']}")
+        or group.get("link")
+        or f"id:{group.get('peer_id')}"
+    )
+
+
+async def _sync_promo_groups_from_folder() -> None:
+    if db_conn is None or not PROMO_FOLDER_NAME:
+        return
+
+    try:
+        filters = await client(functions.messages.GetDialogFiltersRequest())
+    except RPCError as exc:
+        logger.error("Не удалось получить папки диалогов: %s", exc)
+        return
+    except Exception as exc:
+        logger.exception("Не удалось получить папки диалогов: %s", exc)
+        return
+
+    folder_title_lower = PROMO_FOLDER_NAME.lower()
+    target_filter = None
+    for dialog_filter in filters:
+        if getattr(dialog_filter, "title", "").lower() == folder_title_lower:
+            target_filter = dialog_filter
+            break
+
+    if target_filter is None:
+        logger.warning(
+            "Папка '%s' не найдена среди фильтров. Группы рекламы недоступны.",
+            PROMO_FOLDER_NAME,
+        )
+        records: List[Dict[str, Any]] = []
+    else:
+        include_peers = getattr(target_filter, "include_peers", []) or []
+        records = []
+        for peer in include_peers:
+            try:
+                entity = await client.get_entity(peer)
+            except Exception as exc:
+                logger.warning(
+                    "Не удалось получить сущность для папки '%s': %s",
+                    PROMO_FOLDER_NAME,
+                    exc,
+                )
+                continue
+            record = _build_group_record_from_entity(entity)
+            if record:
+                records.append(record)
+
+    async with db_lock:
+        await asyncio.to_thread(_apply_promo_group_records_sync, db_conn, records)
+    logger.info("Папка '%s': синхронизировано групп: %d", PROMO_FOLDER_NAME, len(records))
+
+
+async def ensure_promo_groups_synced(force: bool = False) -> None:
+    global promo_last_sync_ts
+    if not PROMO_FOLDER_NAME:
+        return
+    now = asyncio.get_event_loop().time()
+    interval = max(PROMO_GROUP_SYNC_INTERVAL_SECONDS, 5)
+    if not force and now - promo_last_sync_ts < interval:
+        return
+    async with promo_group_sync_lock:
+        now = asyncio.get_event_loop().time()
+        if not force and now - promo_last_sync_ts < interval:
+            return
+        await _sync_promo_groups_from_folder()
+        promo_last_sync_ts = now
 
 
 def _get_promo_schedule_sync(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -813,11 +993,12 @@ def _trigger_promo_scheduler_check() -> None:
 
 
 async def _get_active_promo_groups() -> List[Dict[str, Any]]:
+    await ensure_promo_groups_synced()
     if db_conn is None:
         return []
     async with db_lock:
         groups = await asyncio.to_thread(_list_promo_groups_sync, db_conn)
-    return [group for group in groups if group.get("enabled")]
+    return [group for group in groups if group.get("enabled") and group.get("peer_id")]
 
 
 async def _get_active_promo_messages() -> List[Dict[str, Any]]:
@@ -912,40 +1093,47 @@ async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: st
         status = "sent"
         details = None
         sent_at = None
-        try:
-            await client.send_message(group["link"], message["text"])
-            sent_at = _current_iso()
-            status = "sent"
-            logger.info("Promo message sent to %s", group.get("title") or group["link"])
-        except FloodWaitError as exc:
-            wait_seconds = int(getattr(exc, "seconds", 30))
-            details = f"flood_wait:{wait_seconds}"
+        target_peer = _group_to_input_peer(group)
+        display_name = _group_display_name(group)
+        if target_peer is None:
             status = "failed"
-            logger.warning(
-                "Flood wait while sending promo to %s: %s",
-                group.get("title") or group["link"],
-                wait_seconds,
-            )
-            await asyncio.sleep(min(wait_seconds + 1, 120))
-        except RPCError as exc:
-            status = "failed"
-            details = f"rpc_error:{exc.__class__.__name__}"
-            logger.exception("RPC error sending promo to %s", group.get("title") or group["link"])
-        except Exception as exc:
-            status = "failed"
-            details = f"error:{exc}"
-            logger.exception("Unexpected error sending promo to %s", group.get("title") or group["link"])
-        finally:
-            await _record_promo_result(
-                day_key=day_key,
-                slot=slot,
-                group=group,
-                message=message,
-                planned_at=planned_iso,
-                sent_at=sent_at,
-                status=status,
-                details=details,
-            )
+            details = "invalid_peer"
+            logger.warning("Promo group %s не имеет корректного peer_id", display_name)
+        else:
+            try:
+                await client.send_message(target_peer, message["text"])
+                sent_at = _current_iso()
+                status = "sent"
+                logger.info("Promo message sent to %s", display_name)
+            except FloodWaitError as exc:
+                wait_seconds = int(getattr(exc, "seconds", 30))
+                details = f"flood_wait:{wait_seconds}"
+                status = "failed"
+                logger.warning(
+                    "Flood wait while sending promo to %s: %s",
+                    display_name,
+                    wait_seconds,
+                )
+                await asyncio.sleep(min(wait_seconds + 1, 120))
+            except RPCError as exc:
+                status = "failed"
+                details = f"rpc_error:{exc.__class__.__name__}"
+                logger.exception("RPC error sending promo to %s", display_name)
+            except Exception as exc:
+                status = "failed"
+                details = f"error:{exc}"
+                logger.exception("Unexpected error sending promo to %s", display_name)
+
+        await _record_promo_result(
+            day_key=day_key,
+            slot=slot,
+            group=group,
+            message=message,
+            planned_at=planned_iso,
+            sent_at=sent_at,
+            status=status,
+            details=details,
+        )
 
         if idx < len(pending_groups) - 1:
             delay = random.uniform(PROMO_MIN_DELAY_SECONDS, PROMO_MAX_DELAY_SECONDS)
@@ -955,6 +1143,7 @@ async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: st
 
 
 async def _promo_scheduler_iteration() -> None:
+    await ensure_promo_groups_synced()
     schedule = await _get_promo_schedule_map()
     if not schedule:
         return
@@ -1465,6 +1654,7 @@ async def on_startup():
     await cleanup_finished_jobs()
     if not await client.is_user_authorized():
         raise RuntimeError("Userbot не авторизован. Сначала запусти scraper_login.py")
+    await ensure_promo_groups_synced(force=True)
     global promo_scheduler_task
     if promo_scheduler_task is None or promo_scheduler_task.done():
         promo_scheduler_task = asyncio.create_task(promo_scheduler_loop())
@@ -1701,8 +1891,10 @@ async def broadcast_stats(limit: int = 30):
 async def get_promo_groups():
     if db_conn is None:
         raise HTTPException(status_code=500, detail="Database is not initialised.")
+    await ensure_promo_groups_synced(force=True)
     async with db_lock:
         groups = await asyncio.to_thread(_list_promo_groups_sync, db_conn)
+    groups = [group for group in groups if group.get("peer_id") and group.get("enabled")]
     return [
         PromoGroupModel(
             id=group["id"],
@@ -1715,43 +1907,6 @@ async def get_promo_groups():
         )
         for group in groups
     ]
-
-
-@app.post("/promo/groups", response_model=PromoGroupModel)
-async def create_promo_group(group: PromoGroupCreate):
-    if db_conn is None:
-        raise HTTPException(status_code=500, detail="Database is not initialised.")
-    link = (group.link or "").strip()
-    if not link:
-        raise HTTPException(status_code=400, detail="Group link is required.")
-    title = (group.title or "").strip() or None
-    try:
-        async with db_lock:
-            created = await asyncio.to_thread(_create_promo_group_sync, db_conn, title, link)
-    except sqlite3.IntegrityError:
-        raise HTTPException(status_code=409, detail="Group already exists.")
-    _trigger_promo_scheduler_check()
-    return PromoGroupModel(
-        id=created["id"],
-        title=created.get("title"),
-        link=created["link"],
-        enabled=created.get("enabled", True),
-        added_at=created["added_at"],
-        last_sent_at=created.get("last_sent_at"),
-        last_status=created.get("last_status"),
-    )
-
-
-@app.delete("/promo/groups/{group_id}")
-async def delete_promo_group(group_id: int):
-    if db_conn is None:
-        raise HTTPException(status_code=500, detail="Database is not initialised.")
-    async with db_lock:
-        deleted = await asyncio.to_thread(_delete_promo_group_sync, db_conn, group_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Group not found")
-    _trigger_promo_scheduler_check()
-    return {"deleted": True}
 
 
 @app.get("/promo/messages", response_model=List[PromoMessageModel])
@@ -1842,6 +1997,7 @@ async def promo_status(day: Optional[str] = None):
         datetime.fromisoformat(target_day)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid day format")
+    await ensure_promo_groups_synced()
 
     async with db_lock:
         history_rows = await asyncio.to_thread(_fetch_promo_history_day_sync, db_conn, target_day)
