@@ -55,6 +55,7 @@ if PROMO_MAX_DELAY_SECONDS < PROMO_MIN_DELAY_SECONDS:
     PROMO_MAX_DELAY_SECONDS = PROMO_MIN_DELAY_SECONDS + 1.0
 PROMO_FOLDER_NAME = os.getenv("PROMO_FOLDER_NAME", "Бесплатно PR").strip()
 PROMO_GROUP_SYNC_INTERVAL_SECONDS = int(os.getenv("PROMO_GROUP_SYNC_INTERVAL", 300))
+KYIV_OFFSET = timedelta(hours=2)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
@@ -216,6 +217,7 @@ class PromoHistoryEntry(BaseModel):
     link: str
     status: str
     sent_at: Optional[str]
+    message_id: Optional[int]
     message_text: Optional[str]
     details: Optional[str]
 
@@ -254,6 +256,27 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _to_kyiv_str(dt_value: Optional[datetime]) -> Optional[str]:
+    if dt_value is None:
+        return None
+    kyiv_dt = dt_value + KYIV_OFFSET
+    return kyiv_dt.strftime("%H:%M")
+
+
+def _iso_to_kyiv_str(value: Optional[str]) -> Optional[str]:
+    parsed = _parse_iso(value)
+    return _to_kyiv_str(parsed)
+
+
+def _slot_local_time_str(day: str, hour: int, minute: int) -> str:
+    try:
+        slot_dt = datetime.fromisoformat(f"{day}T{hour:02d}:{minute:02d}:00")
+    except ValueError:
+        slot_dt = datetime.utcnow().replace(hour=hour, minute=minute, second=0, microsecond=0)
+    local_str = _to_kyiv_str(slot_dt)
+    return local_str or f"{hour:02d}:{minute:02d}"
 
 
 def _ensure_member_columns(conn: sqlite3.Connection) -> None:
@@ -931,7 +954,7 @@ def _update_group_send_stats_sync(
 def _fetch_promo_history_day_sync(conn: sqlite3.Connection, day_key: str) -> List[Dict[str, Any]]:
     cursor = conn.execute(
         """
-        SELECT day_key, slot, group_id, group_title, link, message_text, sent_at, status, details
+        SELECT day_key, slot, group_id, group_title, link, message_id, message_text, sent_at, status, details
         FROM promo_history
         WHERE day_key = ?
         ORDER BY id ASC
@@ -945,10 +968,11 @@ def _fetch_promo_history_day_sync(conn: sqlite3.Connection, day_key: str) -> Lis
             "group_id": row[2],
             "group_title": row[3],
             "link": row[4],
-            "message_text": row[5],
-            "sent_at": row[6],
-            "status": row[7],
-            "details": row[8],
+            "message_id": row[5],
+            "message_text": row[6],
+            "sent_at": row[7],
+            "status": row[8],
+            "details": row[9],
         }
         for row in rows
     ]
@@ -2038,7 +2062,8 @@ async def promo_status(day: Optional[str] = None):
                 group_title=row.get("group_title"),
                 link=row["link"],
                 status=row["status"],
-                sent_at=row.get("sent_at"),
+                sent_at=_iso_to_kyiv_str(row.get("sent_at")),
+                message_id=row.get("message_id"),
                 message_text=row.get("message_text"),
                 details=row.get("details"),
             )
@@ -2054,7 +2079,7 @@ async def promo_status(day: Optional[str] = None):
         slots.append(
             PromoSlotStatus(
                 slot=slot,
-                scheduled_for=f"{row['hour']:02d}:{row['minute']:02d}",
+                scheduled_for=_slot_local_time_str(target_day, row["hour"], row["minute"]),
                 entries=entries,
             )
         )

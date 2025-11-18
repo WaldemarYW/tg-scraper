@@ -68,6 +68,11 @@ PROMO_SLOT_LABELS = {
     "noon": "Обед",
     "evening": "Вечер",
 }
+PROMO_SLOT_EMOJI = {
+    "morning": "🌅",
+    "noon": "🌤️",
+    "evening": "🌙",
+}
 export_tokens: Dict[str, str] = {}
 current_scrape_job_id: Optional[str] = None
 
@@ -305,11 +310,11 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
     group_summary = data.get("group_summary", [])
     is_paused = bool(data.get("is_paused"))
     lines = [
-        f"Статус за {data.get('day')}:",
+        f"Статус за {data.get('day')}",
         "Автоматическая рассылка: " + ("остановлена" if is_paused else "активна"),
         f"Отправлено: {data.get('total_sent', 0)}, с ошибкой: {data.get('total_failed', 0)}",
         "",
-        "По группам:",
+        "Итог по группам:",
     ]
     if not group_summary:
         lines.append("— нет групп")
@@ -321,20 +326,34 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
             )
     lines.append("")
     for slot in slots:
-        label = PROMO_SLOT_LABELS.get(slot.get("slot"), slot.get("slot"))
-        lines.append(f"{label} ({slot.get('scheduled_for')}):")
+        slot_code = slot.get("slot")
+        label = PROMO_SLOT_LABELS.get(slot_code, slot_code)
+        emoji = PROMO_SLOT_EMOJI.get(slot_code, "")
+        lines.append(f"{emoji} {label} — {slot.get('scheduled_for')}")
         entries = slot.get("entries") or []
         if not entries:
-            lines.append("  — ещё не отправлено")
+            lines.append("   ещё не отправлено")
             continue
         for entry in entries:
+            group_name = entry.get("group_title") or entry.get("link")
+            lines.append(f"{emoji} {group_name}")
             sent_time = entry.get("sent_at") or "—"
-            status = entry.get("status")
+            status = entry.get("status") or "unknown"
+            status_icon = "✅" if status == "sent" else "⚠️"
+            msg_id = entry.get("message_id")
             msg = entry.get("message_text") or ""
             preview = _short_label(msg, 60)
-            group_name = entry.get("group_title") or entry.get("link")
-            lines.append(f"  • {group_name}: {status} ({sent_time}) — {preview}")
-    text = "\n".join(lines)
+            lines.append(f"   Время (Киев): {sent_time}")
+            lines.append(f"   Статус: {status_icon} {status}")
+            if msg_id:
+                lines.append(f"   #{msg_id} — {preview}")
+            else:
+                lines.append(f"   #? — {preview}")
+            details = entry.get("details")
+            if details and status != "sent":
+                lines.append(f"   Детали: {details}")
+            lines.append("")
+    text = "\n".join(lines).strip()
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     control_buttons = [
