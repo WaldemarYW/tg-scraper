@@ -75,7 +75,7 @@ promo_schedule_event = asyncio.Event()
 promo_slot_last_day: Dict[str, str] = {}
 promo_group_sync_lock = asyncio.Lock()
 promo_last_sync_ts: float = 0.0
-promo_paused: bool = False
+promo_paused: bool = True
 promo_control_lock = asyncio.Lock()
 
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
@@ -1660,6 +1660,8 @@ async def on_startup():
     await cleanup_finished_jobs()
     if not await client.is_user_authorized():
         raise RuntimeError("Userbot не авторизован. Сначала запусти scraper_login.py")
+    global promo_paused
+    promo_paused = True
     await ensure_promo_groups_synced(force=True)
     global promo_scheduler_task
     if promo_scheduler_task is None or promo_scheduler_task.done():
