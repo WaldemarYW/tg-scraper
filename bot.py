@@ -60,6 +60,7 @@ PROMO_MESSAGE_DELETE_PREFIX = "promo_message_del:"
 PROMO_SCHEDULE_CALLBACK = "promo_schedule"
 PROMO_SCHEDULE_EDIT_PREFIX = "promo_schedule_edit:"
 PROMO_STATUS_CALLBACK = "promo_status"
+PROMO_SLOTS_CALLBACK = "promo_slots"
 PROMO_SUMMARY_CALLBACK = "promo_summary"
 PROMO_START_CALLBACK = "promo_start"
 PROMO_STOP_CALLBACK = "promo_stop"
@@ -310,6 +311,7 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
     slots = data.get("slots", [])
     group_summary = data.get("group_summary", [])
     is_paused = bool(data.get("is_paused"))
+    current_slot = data.get("current_slot")
     lines = [
         f"Статус за {data.get('day')}",
         "Автоматическая рассылка: " + ("остановлена" if is_paused else "активна"),
@@ -317,7 +319,7 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
         "",
         "Текущий слот:",
     ]
-    slot_blocks: List[str] = []
+    slot_blocks: Dict[str, str] = {}
     for slot in slots:
         slot_code = slot.get("slot")
         label = PROMO_SLOT_LABELS.get(slot_code, slot_code)
@@ -345,9 +347,15 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
                 if details and status != "sent":
                     slot_lines.append(f"   Детали: {details}")
                 slot_lines.append("")
-        slot_blocks.append("\n".join(slot_lines).strip())
+        slot_blocks[slot_code] = "\n".join(slot_lines).strip()
 
-    current_block = slot_blocks[0] if slot_blocks else "Нет доступных слотов"
+    current_block = None
+    if current_slot and current_slot in slot_blocks:
+        current_block = slot_blocks[current_slot]
+    elif slot_blocks:
+        current_block = next(iter(slot_blocks.values()))
+    else:
+        current_block = "Нет доступных слотов"
     lines.append(current_block)
     text = "\n".join(lines).strip()
 
@@ -358,7 +366,7 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
     ]
     keyboard.row(*control_buttons)
     if len(slot_blocks) > 1:
-        keyboard.add(types.InlineKeyboardButton("Показать другие слоты", callback_data="promo_slots"))
+        keyboard.add(types.InlineKeyboardButton("Показать другие слоты", callback_data=PROMO_SLOTS_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("Итог по группам", callback_data=PROMO_SUMMARY_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("Обновить", callback_data=PROMO_STATUS_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
@@ -910,7 +918,7 @@ async def handle_promo_summary_callback(callback_query: types.CallbackQuery):
     await send_promo_summary_view(callback_query.message, edit=True)
 
 
-@dp.callback_query_handler(lambda c: c.data == "promo_slots")
+@dp.callback_query_handler(lambda c: c.data == PROMO_SLOTS_CALLBACK)
 async def handle_promo_slots_callback(callback_query: types.CallbackQuery):
     await callback_query.answer()
     await send_promo_slots_view(callback_query.message, edit=True)

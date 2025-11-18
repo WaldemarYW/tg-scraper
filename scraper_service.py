@@ -245,6 +245,7 @@ class PromoStatusResponse(BaseModel):
     total_sent: int
     total_failed: int
     is_paused: bool
+    current_slot: Optional[str] = None
 
 
 def _current_iso() -> str:
@@ -273,15 +274,6 @@ def _to_kyiv_str(dt_value: Optional[datetime]) -> Optional[str]:
 def _iso_to_kyiv_str(value: Optional[str]) -> Optional[str]:
     parsed = _parse_iso(value)
     return _to_kyiv_str(parsed)
-
-
-def _slot_local_time_str(day: str, hour: int, minute: int) -> str:
-    try:
-        base_date = datetime.fromisoformat(day).date()
-    except ValueError:
-        base_date = datetime.now(KYIV_TZ).date()
-    local_dt = datetime.combine(base_date, time(hour, minute), tzinfo=KYIV_TZ)
-    return local_dt.strftime("%H:%M")
 
 
 def _ensure_member_columns(conn: sqlite3.Connection) -> None:
@@ -1026,6 +1018,56 @@ def _build_day_key(dt: Optional[datetime] = None) -> str:
     return target.date().isoformat()
 
 
+def _build_schedule_plan_for_day(day_key: str, schedule_rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    try:
+        base_date = datetime.fromisoformat(day_key).date()
+    except ValueError:
+        base_date = datetime.now(KYIV_TZ).date()
+
+    plan: List[Dict[str, Any]] = []
+    for row in schedule_rows:
+        slot = row.get("slot")
+        hour = int(row.get("hour", 0))
+        minute = int(row.get("minute", 0))
+        start_local = datetime.combine(base_date, time(hour, minute), tzinfo=KYIV_TZ)
+        plan.append(
+            {
+                "slot": slot,
+                "hour": hour,
+                "minute": minute,
+                "local_start": start_local,
+                "next_start": None,
+                "scheduled_display": start_local.strftime("%H:%M"),
+            }
+        )
+
+    plan.sort(key=lambda e: (e["hour"], e["minute"], e["slot"]))
+    if not plan:
+        return plan
+
+    for idx, entry in enumerate(plan):
+        next_entry = plan[(idx + 1) % len(plan)]
+        next_start = next_entry["local_start"]
+        if next_start <= entry["local_start"]:
+            next_start = next_start + timedelta(days=1)
+        entry["next_start"] = next_start
+    return plan
+
+
+def _determine_current_slot(plan: List[Dict[str, Any]], *, now: Optional[datetime] = None) -> Optional[str]:
+    if not plan:
+        return None
+    now_local = now or datetime.now(KYIV_TZ)
+    for entry in plan:
+        start = entry["local_start"]
+        end = entry["next_start"]
+        if start <= now_local < end:
+            return entry["slot"]
+        if now_local < start:
+            return entry["slot"]
+    return plan[0]["slot"]
+
+
 def _trigger_promo_scheduler_check() -> None:
     if not promo_schedule_event.is_set():
         promo_schedule_event.set()
@@ -1186,24 +1228,30 @@ async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: st
 
 async def _promo_scheduler_iteration() -> None:
     await ensure_promo_groups_synced()
-    schedule = await _get_promo_schedule_map()
-    if not schedule:
+    schedule_map = await _get_promo_schedule_map()
+    if not schedule_map:
         return
     now = datetime.now(KYIV_TZ)
     day_key = _build_day_key(now)
     for slot_name, recorded_day in list(promo_slot_last_day.items()):
         if recorded_day != day_key:
             promo_slot_last_day.pop(slot_name, None)
-    for slot, slot_time in schedule.items():
-        planned_dt = now.replace(
-            hour=slot_time.get("hour", 9),
-            minute=slot_time.get("minute", 0),
-            second=0,
-            microsecond=0,
-        )
-        if now < planned_dt:
-            continue
+    schedule_rows = [
+        {"slot": slot, "hour": times.get("hour"), "minute": times.get("minute")}
+        for slot, times in schedule_map.items()
+    ]
+    plan = _build_schedule_plan_for_day(day_key, schedule_rows)
+    for entry in plan:
+        slot = entry["slot"]
+        slot_time = {"hour": entry["hour"], "minute": entry["minute"]}
+        start_local = entry["local_start"]
+        next_start = entry["next_start"]
         if promo_slot_last_day.get(slot) == day_key:
+            continue
+        if now < start_local:
+            continue
+        if now >= next_start:
+            promo_slot_last_day[slot] = day_key
             continue
         slot_completed = await _run_promo_slot(slot, slot_time, day_key)
         if slot_completed:
@@ -2080,17 +2128,20 @@ async def promo_status(day: Optional[str] = None):
             )
         )
 
+    plan = _build_schedule_plan_for_day(target_day, schedule_rows)
+    current_slot = _determine_current_slot(plan)
+
     slots: List[PromoSlotStatus] = []
     total_sent = 0
     total_failed = 0
 
-    for row in schedule_rows:
-        slot = row["slot"]
+    for entry in plan:
+        slot = entry["slot"]
         entries = slot_entries.get(slot, [])
         slots.append(
             PromoSlotStatus(
                 slot=slot,
-                scheduled_for=_slot_local_time_str(target_day, row["hour"], row["minute"]),
+                scheduled_for=entry["scheduled_display"],
                 entries=entries,
             )
         )
@@ -2115,6 +2166,7 @@ async def promo_status(day: Optional[str] = None):
         total_sent=total_sent,
         total_failed=total_failed,
         is_paused=promo_paused,
+        current_slot=current_slot,
     )
 
 
