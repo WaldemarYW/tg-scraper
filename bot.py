@@ -315,35 +315,40 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
         "Автоматическая рассылка: " + ("остановлена" if is_paused else "активна"),
         f"Отправлено: {data.get('total_sent', 0)}, с ошибкой: {data.get('total_failed', 0)}",
         "",
-        "По слотам:",
+        "Текущий слот:",
     ]
+    slot_blocks: List[str] = []
     for slot in slots:
         slot_code = slot.get("slot")
         label = PROMO_SLOT_LABELS.get(slot_code, slot_code)
         emoji = PROMO_SLOT_EMOJI.get(slot_code, "")
-        lines.append(f"{emoji} {label} — {slot.get('scheduled_for')}")
+        slot_lines = [f"{emoji} {label} — {slot.get('scheduled_for')}"]
         entries = slot.get("entries") or []
         if not entries:
-            lines.append("   ещё не отправлено")
-            continue
-        for entry in entries:
-            group_name = entry.get("group_title") or entry.get("link")
-            lines.append(f"{emoji} {group_name}")
-            sent_time = entry.get("sent_at") or "—"
-            status = entry.get("status") or "unknown"
-            status_icon = "✅" if status == "sent" else "⚠️"
-            msg_id = entry.get("message_id")
-            lines.append(f"   Время (Киев): {sent_time}")
-            lines.append(f"   Статус: {status_icon} {status}")
-            msg_label = msg_id if msg_id else "?"
-            if status == "sent":
-                lines.append(f"   Отправлено сообщение #{msg_label}.")
-            else:
-                lines.append(f"   Попытка сообщения #{msg_label}.")
-            details = entry.get("details")
-            if details and status != "sent":
-                lines.append(f"   Детали: {details}")
-            lines.append("")
+            slot_lines.append("   ещё не отправлено")
+        else:
+            for entry in entries:
+                group_name = entry.get("group_title") or entry.get("link")
+                slot_lines.append(f"{emoji} {group_name}")
+                sent_time = entry.get("sent_at") or "—"
+                status = entry.get("status") or "unknown"
+                status_icon = "✅" if status == "sent" else "⚠️"
+                msg_id = entry.get("message_id")
+                slot_lines.append(f"   Время (Киев): {sent_time}")
+                slot_lines.append(f"   Статус: {status_icon} {status}")
+                msg_label = msg_id if msg_id else "?"
+                if status == "sent":
+                    slot_lines.append(f"   Отправлено сообщение #{msg_label}.")
+                else:
+                    slot_lines.append(f"   Попытка сообщения #{msg_label}.")
+                details = entry.get("details")
+                if details and status != "sent":
+                    slot_lines.append(f"   Детали: {details}")
+                slot_lines.append("")
+        slot_blocks.append("\n".join(slot_lines).strip())
+
+    current_block = slot_blocks[0] if slot_blocks else "Нет доступных слотов"
+    lines.append(current_block)
     text = "\n".join(lines).strip()
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
@@ -352,6 +357,8 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
         types.InlineKeyboardButton("⏹ Стоп", callback_data=PROMO_STOP_CALLBACK),
     ]
     keyboard.row(*control_buttons)
+    if len(slot_blocks) > 1:
+        keyboard.add(types.InlineKeyboardButton("Показать другие слоты", callback_data="promo_slots"))
     keyboard.add(types.InlineKeyboardButton("Итог по группам", callback_data=PROMO_SUMMARY_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("Обновить", callback_data=PROMO_STATUS_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
@@ -383,6 +390,56 @@ async def send_promo_summary_view(target_message: types.Message, *, edit: bool =
                 f"• {title}: {group.get('sent', 0)} успешно, {group.get('failed', 0)} с ошибкой"
             )
     text = "\n".join(lines)
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("Назад", callback_data=PROMO_STATUS_CALLBACK))
+
+    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+
+
+async def send_promo_slots_view(target_message: types.Message, *, edit: bool = False):
+    try:
+        response, data = await api_json("get", "/promo/status", timeout=20)
+    except Exception as exc:
+        await target_message.answer(f"Не удалось получить слоты: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, dict):
+        await target_message.answer(
+            f"Ошибка при получении слотов ({response.status_code}): {response.text}"
+        )
+        return
+
+    slots = data.get("slots", [])
+    lines = ["Все слоты:"]
+    for slot in slots:
+        slot_code = slot.get("slot")
+        label = PROMO_SLOT_LABELS.get(slot_code, slot_code)
+        emoji = PROMO_SLOT_EMOJI.get(slot_code, "")
+        lines.append(f"{emoji} {label} — {slot.get('scheduled_for')}")
+        entries = slot.get("entries") or []
+        if not entries:
+            lines.append("   ещё не отправлено")
+            continue
+        for entry in entries:
+            group_name = entry.get("group_title") or entry.get("link")
+            lines.append(f"{emoji} {group_name}")
+            sent_time = entry.get("sent_at") or "—"
+            status = entry.get("status") or "unknown"
+            status_icon = "✅" if status == "sent" else "⚠️"
+            msg_id = entry.get("message_id")
+            lines.append(f"   Время (Киев): {sent_time}")
+            lines.append(f"   Статус: {status_icon} {status}")
+            msg_label = msg_id if msg_id else "?"
+            if status == "sent":
+                lines.append(f"   Отправлено сообщение #{msg_label}.")
+            else:
+                lines.append(f"   Попытка сообщения #{msg_label}.")
+            details = entry.get("details")
+            if details and status != "sent":
+                lines.append(f"   Детали: {details}")
+            lines.append("")
+    text = "\n".join(lines).strip()
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
     keyboard.add(types.InlineKeyboardButton("Назад", callback_data=PROMO_STATUS_CALLBACK))
@@ -851,6 +908,12 @@ async def handle_promo_status_callback(callback_query: types.CallbackQuery):
 async def handle_promo_summary_callback(callback_query: types.CallbackQuery):
     await callback_query.answer()
     await send_promo_summary_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == "promo_slots")
+async def handle_promo_slots_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await send_promo_slots_view(callback_query.message, edit=True)
 
 
 @dp.callback_query_handler(lambda c: c.data == PROMO_START_CALLBACK)
