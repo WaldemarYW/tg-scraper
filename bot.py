@@ -60,6 +60,7 @@ PROMO_MESSAGE_DELETE_PREFIX = "promo_message_del:"
 PROMO_SCHEDULE_CALLBACK = "promo_schedule"
 PROMO_SCHEDULE_EDIT_PREFIX = "promo_schedule_edit:"
 PROMO_STATUS_CALLBACK = "promo_status"
+PROMO_SUMMARY_CALLBACK = "promo_summary"
 PROMO_START_CALLBACK = "promo_start"
 PROMO_STOP_CALLBACK = "promo_stop"
 PROMO_CLOSE_CALLBACK = "promo_close"
@@ -273,7 +274,7 @@ async def send_promo_schedule_view(target_message: types.Message, *, edit: bool 
         )
         return
 
-    lines = ["Текущее расписание (время сервера):"]
+    lines = ["Текущее расписание (время Киев):"]
     for entry in data:
         label = PROMO_SLOT_LABELS.get(entry["slot"], entry["slot"])
         lines.append(f"• {label}: {entry['hour']:02d}:{entry['minute']:02d}")
@@ -314,17 +315,8 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
         "Автоматическая рассылка: " + ("остановлена" if is_paused else "активна"),
         f"Отправлено: {data.get('total_sent', 0)}, с ошибкой: {data.get('total_failed', 0)}",
         "",
-        "Итог по группам:",
+        "По слотам:",
     ]
-    if not group_summary:
-        lines.append("— нет групп")
-    else:
-        for group in group_summary:
-            title = group.get("title") or group.get("link")
-            lines.append(
-                f"• {title}: {group.get('sent', 0)} отправлено, {group.get('failed', 0)} ошибок"
-            )
-    lines.append("")
     for slot in slots:
         slot_code = slot.get("slot")
         label = PROMO_SLOT_LABELS.get(slot_code, slot_code)
@@ -341,14 +333,13 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
             status = entry.get("status") or "unknown"
             status_icon = "✅" if status == "sent" else "⚠️"
             msg_id = entry.get("message_id")
-            msg = entry.get("message_text") or ""
-            preview = _short_label(msg, 60)
             lines.append(f"   Время (Киев): {sent_time}")
             lines.append(f"   Статус: {status_icon} {status}")
-            if msg_id:
-                lines.append(f"   #{msg_id} — {preview}")
+            msg_label = msg_id if msg_id else "?"
+            if status == "sent":
+                lines.append(f"   Отправлено сообщение #{msg_label}.")
             else:
-                lines.append(f"   #? — {preview}")
+                lines.append(f"   Попытка сообщения #{msg_label}.")
             details = entry.get("details")
             if details and status != "sent":
                 lines.append(f"   Детали: {details}")
@@ -361,8 +352,40 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
         types.InlineKeyboardButton("⏹ Стоп", callback_data=PROMO_STOP_CALLBACK),
     ]
     keyboard.row(*control_buttons)
+    keyboard.add(types.InlineKeyboardButton("Итог по группам", callback_data=PROMO_SUMMARY_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("Обновить", callback_data=PROMO_STATUS_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
+
+    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+
+
+async def send_promo_summary_view(target_message: types.Message, *, edit: bool = False):
+    try:
+        response, data = await api_json("get", "/promo/status", timeout=20)
+    except Exception as exc:
+        await target_message.answer(f"Не удалось получить итог: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, dict):
+        await target_message.answer(
+            f"Ошибка при получении итога ({response.status_code}): {response.text}"
+        )
+        return
+
+    group_summary = data.get("group_summary", [])
+    lines = [f"Итог по группам за {data.get('day')}:"]
+    if not group_summary:
+        lines.append("— нет групп")
+    else:
+        for group in group_summary:
+            title = group.get("title") or group.get("link")
+            lines.append(
+                f"• {title}: {group.get('sent', 0)} успешно, {group.get('failed', 0)} с ошибкой"
+            )
+    text = "\n".join(lines)
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("Назад", callback_data=PROMO_STATUS_CALLBACK))
 
     await _respond_with_markup(target_message, text, keyboard, edit=edit)
 
@@ -822,6 +845,12 @@ async def handle_promo_schedule_callback(callback_query: types.CallbackQuery):
 async def handle_promo_status_callback(callback_query: types.CallbackQuery):
     await callback_query.answer()
     await send_promo_status_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_SUMMARY_CALLBACK)
+async def handle_promo_summary_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await send_promo_summary_view(callback_query.message, edit=True)
 
 
 @dp.callback_query_handler(lambda c: c.data == PROMO_START_CALLBACK)

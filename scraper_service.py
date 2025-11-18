@@ -8,8 +8,9 @@ import random
 import re
 import sqlite3
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, time
 from typing import Any, Dict, List, Optional, Set
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -55,7 +56,8 @@ if PROMO_MAX_DELAY_SECONDS < PROMO_MIN_DELAY_SECONDS:
     PROMO_MAX_DELAY_SECONDS = PROMO_MIN_DELAY_SECONDS + 1.0
 PROMO_FOLDER_NAME = os.getenv("PROMO_FOLDER_NAME", "Бесплатно PR").strip()
 PROMO_GROUP_SYNC_INTERVAL_SECONDS = int(os.getenv("PROMO_GROUP_SYNC_INTERVAL", 300))
-KYIV_OFFSET = timedelta(hours=2)
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+UTC_TZ = timezone.utc
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
@@ -246,23 +248,26 @@ class PromoStatusResponse(BaseModel):
 
 
 def _current_iso() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(UTC_TZ).isoformat()
 
 
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
     if not value:
         return None
     try:
-        return datetime.fromisoformat(value)
+        dt_value = datetime.fromisoformat(value)
     except ValueError:
         return None
+    if dt_value.tzinfo is None:
+        dt_value = dt_value.replace(tzinfo=UTC_TZ)
+    return dt_value
 
 
 def _to_kyiv_str(dt_value: Optional[datetime]) -> Optional[str]:
     if dt_value is None:
         return None
-    kyiv_dt = dt_value + KYIV_OFFSET
-    return kyiv_dt.strftime("%H:%M")
+    local_dt = dt_value.astimezone(KYIV_TZ)
+    return local_dt.strftime("%H:%M")
 
 
 def _iso_to_kyiv_str(value: Optional[str]) -> Optional[str]:
@@ -272,11 +277,11 @@ def _iso_to_kyiv_str(value: Optional[str]) -> Optional[str]:
 
 def _slot_local_time_str(day: str, hour: int, minute: int) -> str:
     try:
-        slot_dt = datetime.fromisoformat(f"{day}T{hour:02d}:{minute:02d}:00")
+        base_date = datetime.fromisoformat(day).date()
     except ValueError:
-        slot_dt = datetime.utcnow().replace(hour=hour, minute=minute, second=0, microsecond=0)
-    local_str = _to_kyiv_str(slot_dt)
-    return local_str or f"{hour:02d}:{minute:02d}"
+        base_date = datetime.now(KYIV_TZ).date()
+    local_dt = datetime.combine(base_date, time(hour, minute), tzinfo=KYIV_TZ)
+    return local_dt.strftime("%H:%M")
 
 
 def _ensure_member_columns(conn: sqlite3.Connection) -> None:
@@ -1011,7 +1016,13 @@ def _count_slot_totals(rows: List[Dict[str, Any]]) -> Dict[str, int]:
 
 
 def _build_day_key(dt: Optional[datetime] = None) -> str:
-    target = dt or datetime.now()
+    if dt is None:
+        target = datetime.now(KYIV_TZ)
+    else:
+        if dt.tzinfo is None:
+            target = dt.replace(tzinfo=UTC_TZ).astimezone(KYIV_TZ)
+        else:
+            target = dt.astimezone(KYIV_TZ)
     return target.date().isoformat()
 
 
@@ -1106,13 +1117,13 @@ async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: st
     if not pending_groups:
         return True
 
-    planned_dt = datetime.now().replace(
+    planned_dt = datetime.now(KYIV_TZ).replace(
         hour=schedule_entry.get("hour", 9),
         minute=schedule_entry.get("minute", 0),
         second=0,
         microsecond=0,
     )
-    planned_iso = planned_dt.isoformat()
+    planned_iso = planned_dt.astimezone(UTC_TZ).isoformat()
 
     logger.info("Starting promo slot %s for %d groups", slot, len(pending_groups))
 
@@ -1178,7 +1189,7 @@ async def _promo_scheduler_iteration() -> None:
     schedule = await _get_promo_schedule_map()
     if not schedule:
         return
-    now = datetime.now()
+    now = datetime.now(KYIV_TZ)
     day_key = _build_day_key(now)
     for slot_name, recorded_day in list(promo_slot_last_day.items()):
         if recorded_day != day_key:
