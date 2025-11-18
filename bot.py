@@ -24,6 +24,7 @@ dp = Dispatcher(bot)
 # Простое хранение "состояния" в памяти: кто сейчас вводит ссылку для скрапа
 user_states: Dict[int, str] = {}  # user_id -> "waiting_for_chat"
 broadcast_states: Dict[int, Dict[str, Any]] = {}
+promo_states: Dict[int, Dict[str, Any]] = {}
 
 
 async def api_request(method: str, endpoint: str, **kwargs):
@@ -50,6 +51,22 @@ CLEAR_EXPORTS_CALLBACK = "clear_exports"
 FULL_EXPORT_CALLBACK = "download_full"
 STOP_BROADCAST_PREFIX = "stop_broadcast:"
 BROADCAST_INFO_PREFIX = "broadcast_info:"
+PROMO_MENU_CALLBACK = "promo_menu"
+PROMO_GROUPS_CALLBACK = "promo_groups"
+PROMO_GROUP_ADD_CALLBACK = "promo_group_add"
+PROMO_GROUP_DELETE_PREFIX = "promo_group_del:"
+PROMO_MESSAGES_CALLBACK = "promo_messages"
+PROMO_MESSAGE_ADD_CALLBACK = "promo_message_add"
+PROMO_MESSAGE_DELETE_PREFIX = "promo_message_del:"
+PROMO_SCHEDULE_CALLBACK = "promo_schedule"
+PROMO_SCHEDULE_EDIT_PREFIX = "promo_schedule_edit:"
+PROMO_STATUS_CALLBACK = "promo_status"
+PROMO_CLOSE_CALLBACK = "promo_close"
+PROMO_SLOT_LABELS = {
+    "morning": "Утро",
+    "noon": "Обед",
+    "evening": "Вечер",
+}
 export_tokens: Dict[str, str] = {}
 current_scrape_job_id: Optional[str] = None
 
@@ -62,6 +79,7 @@ MAIN_KEYBOARD.row(
     types.KeyboardButton("Рассылка"),
     types.KeyboardButton("Статистика по дням"),
 )
+MAIN_KEYBOARD.row(types.KeyboardButton("Реклама"))
 
 SCRAPE_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
 SCRAPE_KEYBOARD.row(types.KeyboardButton("/scrape"))
@@ -75,6 +93,10 @@ BROADCAST_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
 BROADCAST_KEYBOARD.row(types.KeyboardButton("/broadcast"))
 BROADCAST_KEYBOARD.row(types.KeyboardButton("Назад"))
 
+PROMO_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
+PROMO_KEYBOARD.row(types.KeyboardButton("/promo"))
+PROMO_KEYBOARD.row(types.KeyboardButton("Назад"))
+
 
 def _format_log_entries(entries):
     if not entries:
@@ -87,6 +109,236 @@ def _format_log_entries(entries):
         timestamp = entry.get("timestamp", "")
         lines.append(f"{user_display} — {status} ({timestamp})")
     return "\n".join(lines)
+
+
+def _short_label(value: str, limit: int = 32) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+def _parse_time_string(value: str) -> Optional[Tuple[int, int]]:
+    cleaned = value.strip().replace(" ", "")
+    if not cleaned:
+        return None
+    if ":" in cleaned:
+        parts = cleaned.split(":", 1)
+    elif "." in cleaned:
+        parts = cleaned.split(".", 1)
+    else:
+        if len(cleaned) in {3, 4} and cleaned.isdigit():
+            if len(cleaned) == 3:
+                cleaned = "0" + cleaned
+            parts = [cleaned[:2], cleaned[2:]]
+        else:
+            return None
+    try:
+        hour = int(parts[0])
+        minute = int(parts[1])
+    except (ValueError, IndexError):
+        return None
+    if 0 <= hour <= 23 and 0 <= minute <= 59:
+        return hour, minute
+    return None
+
+
+async def _respond_with_markup(
+    target_message: types.Message,
+    text: str,
+    reply_markup: Optional[types.InlineKeyboardMarkup] = None,
+    *,
+    edit: bool = False,
+    parse_mode: Optional[str] = None,
+):
+    if edit:
+        try:
+            await target_message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except MessageNotModified:
+            pass
+    else:
+        await target_message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+
+
+async def send_promo_menu_message(target_message: types.Message, *, edit: bool = False):
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton("Группы", callback_data=PROMO_GROUPS_CALLBACK),
+        types.InlineKeyboardButton("Сообщения", callback_data=PROMO_MESSAGES_CALLBACK),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton("Расписание", callback_data=PROMO_SCHEDULE_CALLBACK),
+        types.InlineKeyboardButton("Статус сегодня", callback_data=PROMO_STATUS_CALLBACK),
+    )
+    keyboard.add(types.InlineKeyboardButton("Закрыть", callback_data=PROMO_CLOSE_CALLBACK))
+    text = (
+        "Меню рекламных рассылок:\n"
+        "• Группы — список ссылок, куда уходит реклама.\n"
+        "• Сообщения — набор рекламных текстов для рандомного выбора.\n"
+        "• Расписание — время отправки утром/днём/вечером."
+    )
+    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+
+
+async def send_promo_groups_view(target_message: types.Message, *, edit: bool = False):
+    try:
+        response, data = await api_json("get", "/promo/groups", timeout=20)
+    except Exception as exc:
+        await target_message.answer(f"Не удалось получить группы: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, list):
+        await target_message.answer(
+            f"Ошибка при получении групп ({response.status_code}): {response.text}"
+        )
+        return
+
+    if not data:
+        text = "Группы для рекламы пока не добавлены."
+    else:
+        lines = ["Список групп:"]
+        for group in data:
+            title = group.get("title") or "Без названия"
+            link = group.get("link")
+            last_status = group.get("last_status") or "—"
+            lines.append(f"#{group['id']}: {title} — {link} (статус: {last_status})")
+        text = "\n".join(lines)
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("➕ Добавить группу", callback_data=PROMO_GROUP_ADD_CALLBACK))
+    for group in data[:10]:
+        label = _short_label(group.get("title") or group.get("link") or str(group.get("id")))
+        keyboard.add(
+            types.InlineKeyboardButton(
+                f"Удалить {label}",
+                callback_data=f"{PROMO_GROUP_DELETE_PREFIX}{group['id']}",
+            )
+        )
+    keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
+
+    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+
+
+async def send_promo_messages_view(target_message: types.Message, *, edit: bool = False):
+    try:
+        response, data = await api_json("get", "/promo/messages", timeout=20)
+    except Exception as exc:
+        await target_message.answer(f"Не удалось получить сообщения: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, list):
+        await target_message.answer(
+            f"Ошибка при получении сообщений ({response.status_code}): {response.text}"
+        )
+        return
+
+    if not data:
+        text = "Сообщения для рекламы ещё не добавлены."
+    else:
+        lines = ["Сохранённые сообщения:"]
+        for item in data:
+            preview = _short_label(item.get("text") or "", 80)
+            lines.append(f"#{item['id']}: {preview}")
+        text = "\n".join(lines)
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("➕ Добавить сообщение", callback_data=PROMO_MESSAGE_ADD_CALLBACK))
+    for item in data[:10]:
+        preview = _short_label(item.get("text") or "", 20)
+        keyboard.add(
+            types.InlineKeyboardButton(
+                f"Удалить #{item['id']}",
+                callback_data=f"{PROMO_MESSAGE_DELETE_PREFIX}{item['id']}",
+            )
+        )
+    keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
+
+    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+
+
+async def send_promo_schedule_view(target_message: types.Message, *, edit: bool = False):
+    try:
+        response, data = await api_json("get", "/promo/schedule", timeout=20)
+    except Exception as exc:
+        await target_message.answer(f"Не удалось получить расписание: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, list):
+        await target_message.answer(
+            f"Ошибка при получении расписания ({response.status_code}): {response.text}"
+        )
+        return
+
+    lines = ["Текущее расписание (время сервера):"]
+    for entry in data:
+        label = PROMO_SLOT_LABELS.get(entry["slot"], entry["slot"])
+        lines.append(f"• {label}: {entry['hour']:02d}:{entry['minute']:02d}")
+    text = "\n".join(lines)
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for entry in data:
+        label = PROMO_SLOT_LABELS.get(entry["slot"], entry["slot"])
+        keyboard.add(
+            types.InlineKeyboardButton(
+                f"Изменить {label}",
+                callback_data=f"{PROMO_SCHEDULE_EDIT_PREFIX}{entry['slot']}",
+            )
+        )
+    keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
+
+    await _respond_with_markup(target_message, text, keyboard, edit=edit)
+
+
+async def send_promo_status_view(target_message: types.Message, *, edit: bool = False):
+    try:
+        response, data = await api_json("get", "/promo/status", timeout=20)
+    except Exception as exc:
+        await target_message.answer(f"Не удалось получить статус: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, dict):
+        await target_message.answer(
+            f"Ошибка при получении статуса ({response.status_code}): {response.text}"
+        )
+        return
+
+    slots = data.get("slots", [])
+    group_summary = data.get("group_summary", [])
+    lines = [
+        f"Статус за {data.get('day')}:",
+        f"Отправлено: {data.get('total_sent', 0)}, с ошибкой: {data.get('total_failed', 0)}",
+        "",
+        "По группам:",
+    ]
+    if not group_summary:
+        lines.append("— нет групп")
+    else:
+        for group in group_summary:
+            title = group.get("title") or group.get("link")
+            lines.append(
+                f"• {title}: {group.get('sent', 0)} отправлено, {group.get('failed', 0)} ошибок"
+            )
+    lines.append("")
+    for slot in slots:
+        label = PROMO_SLOT_LABELS.get(slot.get("slot"), slot.get("slot"))
+        lines.append(f"{label} ({slot.get('scheduled_for')}):")
+        entries = slot.get("entries") or []
+        if not entries:
+            lines.append("  — ещё не отправлено")
+            continue
+        for entry in entries:
+            sent_time = entry.get("sent_at") or "—"
+            status = entry.get("status")
+            msg = entry.get("message_text") or ""
+            preview = _short_label(msg, 60)
+            group_name = entry.get("group_title") or entry.get("link")
+            lines.append(f"  • {group_name}: {status} ({sent_time}) — {preview}")
+    text = "\n".join(lines)
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(types.InlineKeyboardButton("Обновить", callback_data=PROMO_STATUS_CALLBACK))
+    keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
+
+    await _respond_with_markup(target_message, text, keyboard, edit=edit)
 
 
 async def send_broadcast_stats_message(message: types.Message):
@@ -263,6 +515,7 @@ async def cmd_start(message: types.Message):
         "/scrape – создать новую задачу на сбор участников и получить CSV после завершения.\n"
         "/exports – список всех готовых выгрузок.\n"
         "/broadcast – массовая рассылка по собранным пользователям.\n\n"
+        "/promo – реклама в выбранных группах по расписанию.\n\n"
         "Когда нажмёшь /scrape, я попрошу ссылку или @юзернейм чата."
     )
     await message.answer(text, reply_markup=MAIN_KEYBOARD)
@@ -462,8 +715,26 @@ async def handle_main_broadcast_menu(message: types.Message):
     await cmd_broadcast(message)
 
 
+async def open_promo_menu(message: types.Message):
+    user_id = message.from_user.id
+    promo_states.pop(user_id, None)
+    await message.answer("Меню рекламы:", reply_markup=PROMO_KEYBOARD)
+    await send_promo_menu_message(message)
+
+
+@dp.message_handler(commands=["promo"])
+async def cmd_promo(message: types.Message):
+    await open_promo_menu(message)
+
+
+@dp.message_handler(lambda m: m.text == "Реклама")
+async def handle_main_promo_menu(message: types.Message):
+    await open_promo_menu(message)
+
+
 @dp.message_handler(lambda m: m.text == "Назад")
 async def handle_back_to_main(message: types.Message):
+    promo_states.pop(message.from_user.id, None)
     await message.answer("Возврат в главное меню.", reply_markup=MAIN_KEYBOARD)
 
 
@@ -497,11 +768,123 @@ async def handle_stop_scrape_text(message: types.Message):
         current_scrape_job_id = None
 
 
+@dp.callback_query_handler(lambda c: c.data == PROMO_MENU_CALLBACK)
+async def handle_promo_menu_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await send_promo_menu_message(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_GROUPS_CALLBACK)
+async def handle_promo_groups_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await send_promo_groups_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_MESSAGES_CALLBACK)
+async def handle_promo_messages_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await send_promo_messages_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_SCHEDULE_CALLBACK)
+async def handle_promo_schedule_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await send_promo_schedule_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_STATUS_CALLBACK)
+async def handle_promo_status_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer()
+    await send_promo_status_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_GROUP_ADD_CALLBACK)
+async def handle_promo_group_add_callback(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    promo_states[user_id] = {"mode": "add_group", "step": "awaiting_link"}
+    await callback_query.answer("Введите ссылку")
+    await callback_query.message.answer(
+        "Пришли ссылку или @юзернейм группы, куда надо отправлять рекламу."
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(PROMO_GROUP_DELETE_PREFIX))
+async def handle_promo_group_delete_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer("Удаляю…")
+    try:
+        group_id = int(callback_query.data[len(PROMO_GROUP_DELETE_PREFIX) :])
+    except ValueError:
+        await callback_query.message.answer("Некорректный идентификатор группы.")
+        return
+    try:
+        response, data = await api_json("delete", f"/promo/groups/{group_id}", timeout=20)
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось удалить группу: {exc}")
+        return
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка удаления группы ({response.status_code}): {response.text}"
+        )
+        return
+    await callback_query.message.answer("Группа удалена ✅")
+    await send_promo_groups_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_MESSAGE_ADD_CALLBACK)
+async def handle_promo_message_add_callback(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    promo_states[user_id] = {"mode": "add_message"}
+    await callback_query.answer("Введите текст")
+    await callback_query.message.answer(
+        "Пришли текст рекламного сообщения. Можно использовать несколько строк."
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(PROMO_MESSAGE_DELETE_PREFIX))
+async def handle_promo_message_delete_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer("Удаляю…")
+    try:
+        message_id = int(callback_query.data[len(PROMO_MESSAGE_DELETE_PREFIX) :])
+    except ValueError:
+        await callback_query.message.answer("Некорректный идентификатор сообщения.")
+        return
+    try:
+        response, data = await api_json("delete", f"/promo/messages/{message_id}", timeout=20)
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось удалить сообщение: {exc}")
+        return
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка удаления сообщения ({response.status_code}): {response.text}"
+        )
+        return
+    await callback_query.message.answer("Сообщение удалено ✅")
+    await send_promo_messages_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(PROMO_SCHEDULE_EDIT_PREFIX))
+async def handle_promo_schedule_edit_callback(callback_query: types.CallbackQuery):
+    slot = callback_query.data[len(PROMO_SCHEDULE_EDIT_PREFIX) :]
+    label = PROMO_SLOT_LABELS.get(slot, slot)
+    promo_states[callback_query.from_user.id] = {"mode": "edit_schedule", "slot": slot}
+    await callback_query.answer("Укажи время")
+    await callback_query.message.answer(
+        f"Введи новое время для {label} в формате ЧЧ:ММ. Например 09:30"
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_CLOSE_CALLBACK)
+async def handle_promo_close_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer("Меню закрыто")
+    await callback_query.message.edit_text("Меню рекламы закрыто.")
+
+
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
     broadcast_state = broadcast_states.get(user_id)
+    promo_state = promo_states.get(user_id)
     global current_scrape_job_id
 
     if broadcast_state:
@@ -541,6 +924,87 @@ async def handle_text(message: types.Message):
             broadcast_state["interval"] = interval_value
             await start_broadcast(message, user_id, broadcast_state)
             broadcast_states.pop(user_id, None)
+            return
+
+    if promo_state:
+        text_value = (message.text or "").strip()
+        lowered = text_value.lower()
+        if lowered in {"отмена", "cancel"}:
+            promo_states.pop(user_id, None)
+            await message.answer("Действие отменено.", reply_markup=MAIN_KEYBOARD)
+            return
+        mode = promo_state.get("mode")
+        if mode == "add_group":
+            step = promo_state.get("step", "awaiting_link")
+            if step == "awaiting_link":
+                if not text_value:
+                    await message.answer("Пришли ссылку на группу или @username.")
+                    return
+                promo_state["link"] = text_value
+                promo_state["step"] = "awaiting_title"
+                await message.answer(
+                    "Если хочешь задать название, отправь его. Иначе пришли '-' для пропуска."
+                )
+                return
+            if step == "awaiting_title":
+                title = None if lowered in {"-", "нет", "skip"} else text_value
+                payload = {"link": promo_state.get("link"), "title": title}
+                try:
+                    response, data = await api_json("post", "/promo/groups", json=payload, timeout=20)
+                except Exception as exc:
+                    await message.answer(f"Не удалось сохранить группу: {exc}")
+                    return
+                if response.status_code != 200 or not isinstance(data, dict):
+                    await message.answer(
+                        f"Ошибка при сохранении группы ({response.status_code}): {response.text}"
+                    )
+                    return
+                promo_states.pop(user_id, None)
+                title_display = data.get("title") or data.get("link")
+                await message.answer(f"Группа {title_display} добавлена ✅")
+                await send_promo_groups_view(message)
+                return
+        elif mode == "add_message":
+            if not text_value:
+                await message.answer("Текст сообщения не должен быть пустым.")
+                return
+            payload = {"text": message.text}
+            try:
+                response, data = await api_json("post", "/promo/messages", json=payload, timeout=20)
+            except Exception as exc:
+                await message.answer(f"Не удалось сохранить сообщение: {exc}")
+                return
+            if response.status_code != 200 or not isinstance(data, dict):
+                await message.answer(
+                    f"Ошибка при сохранении сообщения ({response.status_code}): {response.text}"
+                )
+                return
+            promo_states.pop(user_id, None)
+            await message.answer("Сообщение добавлено ✅")
+            await send_promo_messages_view(message)
+            return
+        elif mode == "edit_schedule":
+            slot = promo_state.get("slot")
+            parsed = _parse_time_string(text_value)
+            if not parsed:
+                await message.answer("Нужно время в формате ЧЧ:ММ, например 09:00")
+                return
+            hour, minute = parsed
+            payload = {"slot": slot, "hour": hour, "minute": minute}
+            try:
+                response, data = await api_json("put", "/promo/schedule", json=payload, timeout=20)
+            except Exception as exc:
+                await message.answer(f"Не удалось обновить расписание: {exc}")
+                return
+            if response.status_code != 200 or not isinstance(data, dict):
+                await message.answer(
+                    f"Ошибка при обновлении расписания ({response.status_code}): {response.text}"
+                )
+                return
+            promo_states.pop(user_id, None)
+            label = PROMO_SLOT_LABELS.get(slot, slot)
+            await message.answer(f"{label} обновлено на {hour:02d}:{minute:02d} ✅")
+            await send_promo_schedule_view(message)
             return
 
     # если мы ждем от этого юзера ссылку для скрапа

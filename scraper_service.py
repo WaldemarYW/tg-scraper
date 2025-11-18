@@ -4,13 +4,12 @@ import csv
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set
-import re
-import tempfile
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -40,6 +39,19 @@ CSV_OUTPUT_DIR = os.getenv("CSV_OUTPUT_DIR", "exports")
 FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
 FULL_EXPORT_NAME = "members_full.csv"
 
+PROMO_SLOTS = ("morning", "noon", "evening")
+PROMO_DEFAULT_SCHEDULE = {
+    "morning": {"hour": 9, "minute": 0},
+    "noon": {"hour": 13, "minute": 0},
+    "evening": {"hour": 18, "minute": 0},
+}
+PROMO_MIN_DELAY_SECONDS = float(os.getenv("PROMO_MIN_DELAY", 6))
+PROMO_MAX_DELAY_SECONDS = float(os.getenv("PROMO_MAX_DELAY", 18))
+if PROMO_MIN_DELAY_SECONDS < 0:
+    PROMO_MIN_DELAY_SECONDS = 0.0
+if PROMO_MAX_DELAY_SECONDS < PROMO_MIN_DELAY_SECONDS:
+    PROMO_MAX_DELAY_SECONDS = PROMO_MIN_DELAY_SECONDS + 1.0
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
 
@@ -54,6 +66,9 @@ broadcast_lock = asyncio.Lock()
 BROADCAST_JOBS: Dict[str, Dict[str, Any]] = {}
 current_broadcast_job_id: Optional[str] = None
 current_scrape_job_id: Optional[str] = None
+promo_scheduler_task: Optional[asyncio.Task] = None
+promo_schedule_event = asyncio.Event()
+promo_slot_last_day: Dict[str, str] = {}
 
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 
@@ -154,6 +169,76 @@ class BroadcastStatsEntry(BaseModel):
     processed: int
 
 
+class PromoGroupModel(BaseModel):
+    id: int
+    title: Optional[str]
+    link: str
+    enabled: bool
+    added_at: str
+    last_sent_at: Optional[str]
+    last_status: Optional[str]
+
+
+class PromoGroupCreate(BaseModel):
+    title: Optional[str]
+    link: str
+
+
+class PromoMessageModel(BaseModel):
+    id: int
+    text: str
+    enabled: bool
+    added_at: str
+
+
+class PromoMessageCreate(BaseModel):
+    text: str
+
+
+class PromoScheduleEntry(BaseModel):
+    slot: str
+    hour: int
+    minute: int
+
+
+class PromoScheduleUpdate(BaseModel):
+    slot: str
+    hour: int
+    minute: int
+
+
+class PromoHistoryEntry(BaseModel):
+    group_id: int
+    group_title: Optional[str]
+    link: str
+    status: str
+    sent_at: Optional[str]
+    message_text: Optional[str]
+    details: Optional[str]
+
+
+class PromoSlotStatus(BaseModel):
+    slot: str
+    scheduled_for: str
+    entries: List[PromoHistoryEntry]
+
+
+class PromoGroupSummary(BaseModel):
+    group_id: int
+    title: Optional[str]
+    link: str
+    sent: int
+    failed: int
+
+
+class PromoStatusResponse(BaseModel):
+    day: str
+    slots: List[PromoSlotStatus]
+    group_summary: List[PromoGroupSummary]
+    total_sent: int
+    total_failed: int
+
+
 def _current_iso() -> str:
     return datetime.utcnow().isoformat()
 
@@ -204,6 +289,88 @@ def _ensure_broadcast_history_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.commit()
+
+
+def _ensure_promo_tables(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            link TEXT NOT NULL UNIQUE,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            added_at TEXT NOT NULL,
+            last_sent_at TEXT,
+            last_status TEXT
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            added_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_schedule (
+            slot TEXT PRIMARY KEY,
+            hour INTEGER NOT NULL,
+            minute INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            day_key TEXT NOT NULL,
+            slot TEXT NOT NULL,
+            group_id INTEGER NOT NULL,
+            group_title TEXT,
+            link TEXT NOT NULL,
+            message_id INTEGER,
+            message_text TEXT,
+            planned_at TEXT NOT NULL,
+            sent_at TEXT,
+            status TEXT NOT NULL,
+            details TEXT,
+            FOREIGN KEY(group_id) REFERENCES promo_groups(id),
+            FOREIGN KEY(message_id) REFERENCES promo_messages(id)
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_promo_history_day_slot
+        ON promo_history(day_key, slot)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_promo_history_group
+        ON promo_history(group_id, day_key)
+        """
+    )
+    conn.commit()
+
+
+def _ensure_default_promo_schedule(conn: sqlite3.Connection) -> None:
+    for slot in PROMO_SLOTS:
+        defaults = PROMO_DEFAULT_SCHEDULE.get(slot, {"hour": 9, "minute": 0})
+        conn.execute(
+            """
+            INSERT INTO promo_schedule(slot, hour, minute)
+            VALUES(?, ?, ?)
+            ON CONFLICT(slot) DO NOTHING
+            """,
+            (slot, defaults["hour"], defaults["minute"]),
+        )
     conn.commit()
 
 
@@ -370,6 +537,461 @@ def _clear_csv_exports() -> int:
                 continue
     return removed
 
+
+def _list_promo_groups_sync(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    cursor = conn.execute(
+        """
+        SELECT id, title, link, enabled, added_at, last_sent_at, last_status
+        FROM promo_groups
+        ORDER BY id ASC
+        """
+    )
+    rows = cursor.fetchall()
+    return [
+        {
+            "id": row[0],
+            "title": row[1],
+            "link": row[2],
+            "enabled": bool(row[3]),
+            "added_at": row[4],
+            "last_sent_at": row[5],
+            "last_status": row[6],
+        }
+        for row in rows
+    ]
+
+
+def _create_promo_group_sync(conn: sqlite3.Connection, title: Optional[str], link: str) -> Dict[str, Any]:
+    now = _current_iso()
+    conn.execute(
+        """
+        INSERT INTO promo_groups(title, link, enabled, added_at)
+        VALUES(?, ?, 1, ?)
+        """,
+        (title, link, now),
+    )
+    conn.commit()
+    cursor = conn.execute(
+        """
+        SELECT id, title, link, enabled, added_at, last_sent_at, last_status
+        FROM promo_groups
+        WHERE link = ?
+        """,
+        (link,),
+    )
+    row = cursor.fetchone()
+    return {
+        "id": row[0],
+        "title": row[1],
+        "link": row[2],
+        "enabled": bool(row[3]),
+        "added_at": row[4],
+        "last_sent_at": row[5],
+        "last_status": row[6],
+    }
+
+
+def _delete_promo_group_sync(conn: sqlite3.Connection, group_id: int) -> bool:
+    cursor = conn.execute("DELETE FROM promo_groups WHERE id = ?", (group_id,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def _list_promo_messages_sync(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    cursor = conn.execute(
+        """
+        SELECT id, text, enabled, added_at
+        FROM promo_messages
+        ORDER BY id ASC
+        """
+    )
+    rows = cursor.fetchall()
+    return [
+        {
+            "id": row[0],
+            "text": row[1],
+            "enabled": bool(row[2]),
+            "added_at": row[3],
+        }
+        for row in rows
+    ]
+
+
+def _create_promo_message_sync(conn: sqlite3.Connection, text: str) -> Dict[str, Any]:
+    now = _current_iso()
+    conn.execute(
+        """
+        INSERT INTO promo_messages(text, enabled, added_at)
+        VALUES(?, 1, ?)
+        """,
+        (text, now),
+    )
+    conn.commit()
+    cursor = conn.execute(
+        """
+        SELECT id, text, enabled, added_at
+        FROM promo_messages
+        WHERE rowid = last_insert_rowid()
+        """
+    )
+    row = cursor.fetchone()
+    return {
+        "id": row[0],
+        "text": row[1],
+        "enabled": bool(row[2]),
+        "added_at": row[3],
+    }
+
+
+def _delete_promo_message_sync(conn: sqlite3.Connection, message_id: int) -> bool:
+    cursor = conn.execute("DELETE FROM promo_messages WHERE id = ?", (message_id,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+
+def _get_promo_schedule_sync(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    cursor = conn.execute(
+        """
+        SELECT slot, hour, minute
+        FROM promo_schedule
+        ORDER BY CASE slot
+            WHEN 'morning' THEN 0
+            WHEN 'noon' THEN 1
+            WHEN 'evening' THEN 2
+            ELSE 3 END, slot
+        """
+    )
+    rows = cursor.fetchall()
+    return [{"slot": row[0], "hour": row[1], "minute": row[2]} for row in rows]
+
+
+def _update_promo_schedule_entry_sync(conn: sqlite3.Connection, slot: str, hour: int, minute: int) -> None:
+    conn.execute(
+        """
+        INSERT INTO promo_schedule(slot, hour, minute)
+        VALUES(?, ?, ?)
+        ON CONFLICT(slot) DO UPDATE SET hour = excluded.hour, minute = excluded.minute
+        """,
+        (slot, hour, minute),
+    )
+    conn.commit()
+
+
+def _fetch_promo_schedule_map_sync(conn: sqlite3.Connection) -> Dict[str, Dict[str, int]]:
+    rows = _get_promo_schedule_sync(conn)
+    return {row["slot"]: {"hour": row["hour"], "minute": row["minute"]} for row in rows}
+
+
+def _fetch_slot_done_groups_sync(conn: sqlite3.Connection, day_key: str, slot: str) -> Set[int]:
+    cursor = conn.execute(
+        """
+        SELECT DISTINCT group_id FROM promo_history
+        WHERE day_key = ? AND slot = ?
+        """,
+        (day_key, slot),
+    )
+    return {row[0] for row in cursor.fetchall()}
+
+
+def _record_promo_history_sync(
+    conn: sqlite3.Connection,
+    *,
+    day_key: str,
+    slot: str,
+    group: Dict[str, Any],
+    message: Optional[Dict[str, Any]],
+    planned_at: str,
+    sent_at: Optional[str],
+    status: str,
+    details: Optional[str],
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO promo_history(day_key, slot, group_id, group_title, link, message_id, message_text, planned_at, sent_at, status, details)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            day_key,
+            slot,
+            group["id"],
+            group.get("title"),
+            group["link"],
+            message.get("id") if message else None,
+            message.get("text") if message else None,
+            planned_at,
+            sent_at,
+            status,
+            details,
+        ),
+    )
+    conn.commit()
+
+
+def _update_group_send_stats_sync(
+    conn: sqlite3.Connection,
+    group_id: int,
+    sent_at: Optional[str],
+    status: str,
+) -> None:
+    conn.execute(
+        """
+        UPDATE promo_groups
+        SET last_sent_at = ?, last_status = ?
+        WHERE id = ?
+        """,
+        (sent_at, status, group_id),
+    )
+    conn.commit()
+
+
+def _fetch_promo_history_day_sync(conn: sqlite3.Connection, day_key: str) -> List[Dict[str, Any]]:
+    cursor = conn.execute(
+        """
+        SELECT day_key, slot, group_id, group_title, link, message_text, sent_at, status, details
+        FROM promo_history
+        WHERE day_key = ?
+        ORDER BY id ASC
+        """,
+        (day_key,),
+    )
+    rows = cursor.fetchall()
+    return [
+        {
+            "slot": row[1],
+            "group_id": row[2],
+            "group_title": row[3],
+            "link": row[4],
+            "message_text": row[5],
+            "sent_at": row[6],
+            "status": row[7],
+            "details": row[8],
+        }
+        for row in rows
+    ]
+
+
+def _fetch_promo_group_summary_sync(conn: sqlite3.Connection, day_key: str) -> List[Dict[str, Any]]:
+    cursor = conn.execute(
+        """
+        SELECT g.id, COALESCE(g.title, ''), g.link,
+               SUM(CASE WHEN h.status = 'sent' THEN 1 ELSE 0 END) as sent_count,
+               SUM(CASE WHEN h.status != 'sent' THEN 1 ELSE 0 END) as failed_count
+        FROM promo_groups g
+        LEFT JOIN promo_history h ON g.id = h.group_id AND h.day_key = ?
+        GROUP BY g.id, g.title, g.link
+        ORDER BY g.id
+        """,
+        (day_key,),
+    )
+    rows = cursor.fetchall()
+    return [
+        {
+            "group_id": row[0],
+            "title": row[1] or None,
+            "link": row[2],
+            "sent": row[3] or 0,
+            "failed": row[4] or 0,
+        }
+        for row in rows
+    ]
+
+
+def _count_slot_totals(rows: List[Dict[str, Any]]) -> Dict[str, int]:
+    sent = sum(1 for row in rows if row.get("status") == "sent")
+    failed = sum(1 for row in rows if row.get("status") != "sent")
+    return {"sent": sent, "failed": failed}
+
+
+def _build_day_key(dt: Optional[datetime] = None) -> str:
+    target = dt or datetime.now()
+    return target.date().isoformat()
+
+
+def _trigger_promo_scheduler_check() -> None:
+    if not promo_schedule_event.is_set():
+        promo_schedule_event.set()
+
+
+async def _get_active_promo_groups() -> List[Dict[str, Any]]:
+    if db_conn is None:
+        return []
+    async with db_lock:
+        groups = await asyncio.to_thread(_list_promo_groups_sync, db_conn)
+    return [group for group in groups if group.get("enabled")]
+
+
+async def _get_active_promo_messages() -> List[Dict[str, Any]]:
+    if db_conn is None:
+        return []
+    async with db_lock:
+        messages = await asyncio.to_thread(_list_promo_messages_sync, db_conn)
+    return [message for message in messages if message.get("enabled")]
+
+
+async def _get_promo_schedule_map() -> Dict[str, Dict[str, int]]:
+    if db_conn is None:
+        return {}
+    async with db_lock:
+        schedule = await asyncio.to_thread(_fetch_promo_schedule_map_sync, db_conn)
+    return schedule
+
+
+async def _get_pending_groups(slot: str, day_key: str, groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not groups or db_conn is None:
+        return []
+    async with db_lock:
+        done_ids = await asyncio.to_thread(_fetch_slot_done_groups_sync, db_conn, day_key, slot)
+    return [group for group in groups if group["id"] not in done_ids]
+
+
+async def _record_promo_result(
+    *,
+    day_key: str,
+    slot: str,
+    group: Dict[str, Any],
+    message: Optional[Dict[str, Any]],
+    planned_at: str,
+    sent_at: Optional[str],
+    status: str,
+    details: Optional[str],
+) -> None:
+    if db_conn is None:
+        return
+    async with db_lock:
+        await asyncio.to_thread(
+            _record_promo_history_sync,
+            db_conn,
+            day_key=day_key,
+            slot=slot,
+            group=group,
+            message=message,
+            planned_at=planned_at,
+            sent_at=sent_at,
+            status=status,
+            details=details,
+        )
+        await asyncio.to_thread(
+            _update_group_send_stats_sync,
+            db_conn,
+            group["id"],
+            sent_at,
+            status,
+        )
+
+
+async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: str) -> bool:
+    groups = await _get_active_promo_groups()
+    if not groups:
+        logger.info("Promo slot %s skipped — no groups configured", slot)
+        return False
+
+    messages = await _get_active_promo_messages()
+    if not messages:
+        logger.warning("Promo slot %s skipped — no messages configured", slot)
+        return False
+
+    pending_groups = await _get_pending_groups(slot, day_key, groups)
+    if not pending_groups:
+        return True
+
+    planned_dt = datetime.now().replace(
+        hour=schedule_entry.get("hour", 9),
+        minute=schedule_entry.get("minute", 0),
+        second=0,
+        microsecond=0,
+    )
+    planned_iso = planned_dt.isoformat()
+
+    logger.info("Starting promo slot %s for %d groups", slot, len(pending_groups))
+
+    if not client.is_connected():
+        await client.connect()
+
+    for idx, group in enumerate(pending_groups):
+        message = random.choice(messages)
+        status = "sent"
+        details = None
+        sent_at = None
+        try:
+            await client.send_message(group["link"], message["text"])
+            sent_at = _current_iso()
+            status = "sent"
+            logger.info("Promo message sent to %s", group.get("title") or group["link"])
+        except FloodWaitError as exc:
+            wait_seconds = int(getattr(exc, "seconds", 30))
+            details = f"flood_wait:{wait_seconds}"
+            status = "failed"
+            logger.warning(
+                "Flood wait while sending promo to %s: %s",
+                group.get("title") or group["link"],
+                wait_seconds,
+            )
+            await asyncio.sleep(min(wait_seconds + 1, 120))
+        except RPCError as exc:
+            status = "failed"
+            details = f"rpc_error:{exc.__class__.__name__}"
+            logger.exception("RPC error sending promo to %s", group.get("title") or group["link"])
+        except Exception as exc:
+            status = "failed"
+            details = f"error:{exc}"
+            logger.exception("Unexpected error sending promo to %s", group.get("title") or group["link"])
+        finally:
+            await _record_promo_result(
+                day_key=day_key,
+                slot=slot,
+                group=group,
+                message=message,
+                planned_at=planned_iso,
+                sent_at=sent_at,
+                status=status,
+                details=details,
+            )
+
+        if idx < len(pending_groups) - 1:
+            delay = random.uniform(PROMO_MIN_DELAY_SECONDS, PROMO_MAX_DELAY_SECONDS)
+            await asyncio.sleep(delay)
+
+    return True
+
+
+async def _promo_scheduler_iteration() -> None:
+    schedule = await _get_promo_schedule_map()
+    if not schedule:
+        return
+    now = datetime.now()
+    day_key = _build_day_key(now)
+    for slot_name, recorded_day in list(promo_slot_last_day.items()):
+        if recorded_day != day_key:
+            promo_slot_last_day.pop(slot_name, None)
+    for slot, slot_time in schedule.items():
+        planned_dt = now.replace(
+            hour=slot_time.get("hour", 9),
+            minute=slot_time.get("minute", 0),
+            second=0,
+            microsecond=0,
+        )
+        if now < planned_dt:
+            continue
+        if promo_slot_last_day.get(slot) == day_key:
+            continue
+        slot_completed = await _run_promo_slot(slot, slot_time, day_key)
+        if slot_completed:
+            promo_slot_last_day[slot] = day_key
+
+
+async def promo_scheduler_loop() -> None:
+    logger.info("Promo scheduler started")
+    while True:
+        try:
+            await _promo_scheduler_iteration()
+        except Exception as exc:
+            logger.exception("Promo scheduler iteration failed: %s", exc)
+        wait_time = 60.0
+        try:
+            await asyncio.wait_for(promo_schedule_event.wait(), timeout=wait_time)
+            promo_schedule_event.clear()
+        except asyncio.TimeoutError:
+            continue
 
 
 
@@ -759,6 +1381,8 @@ def init_db() -> sqlite3.Connection:
     conn.commit()
     _ensure_member_columns(conn)
     _ensure_broadcast_history_table(conn)
+    _ensure_promo_tables(conn)
+    _ensure_default_promo_schedule(conn)
     return conn
 
 
@@ -841,6 +1465,9 @@ async def on_startup():
     await cleanup_finished_jobs()
     if not await client.is_user_authorized():
         raise RuntimeError("Userbot не авторизован. Сначала запусти scraper_login.py")
+    global promo_scheduler_task
+    if promo_scheduler_task is None or promo_scheduler_task.done():
+        promo_scheduler_task = asyncio.create_task(promo_scheduler_loop())
 
 
 @app.on_event("shutdown")
@@ -850,6 +1477,14 @@ async def on_shutdown():
     if db_conn:
         db_conn.close()
         db_conn = None
+    global promo_scheduler_task
+    if promo_scheduler_task:
+        promo_scheduler_task.cancel()
+        try:
+            await promo_scheduler_task
+        except asyncio.CancelledError:
+            pass
+        promo_scheduler_task = None
 
 
 @app.post("/scrape", response_model=JobResponse, status_code=202)
@@ -1060,6 +1695,208 @@ async def broadcast_stats(limit: int = 30):
         BroadcastStatsEntry(date=row["date"], processed=row["processed"])
         for row in rows
     ]
+
+
+@app.get("/promo/groups", response_model=List[PromoGroupModel])
+async def get_promo_groups():
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    async with db_lock:
+        groups = await asyncio.to_thread(_list_promo_groups_sync, db_conn)
+    return [
+        PromoGroupModel(
+            id=group["id"],
+            title=group.get("title"),
+            link=group["link"],
+            enabled=group.get("enabled", True),
+            added_at=group["added_at"],
+            last_sent_at=group.get("last_sent_at"),
+            last_status=group.get("last_status"),
+        )
+        for group in groups
+    ]
+
+
+@app.post("/promo/groups", response_model=PromoGroupModel)
+async def create_promo_group(group: PromoGroupCreate):
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    link = (group.link or "").strip()
+    if not link:
+        raise HTTPException(status_code=400, detail="Group link is required.")
+    title = (group.title or "").strip() or None
+    try:
+        async with db_lock:
+            created = await asyncio.to_thread(_create_promo_group_sync, db_conn, title, link)
+    except sqlite3.IntegrityError:
+        raise HTTPException(status_code=409, detail="Group already exists.")
+    _trigger_promo_scheduler_check()
+    return PromoGroupModel(
+        id=created["id"],
+        title=created.get("title"),
+        link=created["link"],
+        enabled=created.get("enabled", True),
+        added_at=created["added_at"],
+        last_sent_at=created.get("last_sent_at"),
+        last_status=created.get("last_status"),
+    )
+
+
+@app.delete("/promo/groups/{group_id}")
+async def delete_promo_group(group_id: int):
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    async with db_lock:
+        deleted = await asyncio.to_thread(_delete_promo_group_sync, db_conn, group_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Group not found")
+    _trigger_promo_scheduler_check()
+    return {"deleted": True}
+
+
+@app.get("/promo/messages", response_model=List[PromoMessageModel])
+async def get_promo_messages():
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    async with db_lock:
+        messages = await asyncio.to_thread(_list_promo_messages_sync, db_conn)
+    return [
+        PromoMessageModel(
+            id=message["id"],
+            text=message["text"],
+            enabled=message.get("enabled", True),
+            added_at=message["added_at"],
+        )
+        for message in messages
+    ]
+
+
+@app.post("/promo/messages", response_model=PromoMessageModel)
+async def create_promo_message(payload: PromoMessageCreate):
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Message text is required.")
+    async with db_lock:
+        message = await asyncio.to_thread(_create_promo_message_sync, db_conn, text)
+    _trigger_promo_scheduler_check()
+    return PromoMessageModel(
+        id=message["id"],
+        text=message["text"],
+        enabled=message.get("enabled", True),
+        added_at=message["added_at"],
+    )
+
+
+@app.delete("/promo/messages/{message_id}")
+async def delete_promo_message(message_id: int):
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    async with db_lock:
+        deleted = await asyncio.to_thread(_delete_promo_message_sync, db_conn, message_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Message not found")
+    _trigger_promo_scheduler_check()
+    return {"deleted": True}
+
+
+@app.get("/promo/schedule", response_model=List[PromoScheduleEntry])
+async def get_promo_schedule():
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    async with db_lock:
+        schedule = await asyncio.to_thread(_get_promo_schedule_sync, db_conn)
+    return [
+        PromoScheduleEntry(slot=row["slot"], hour=row["hour"], minute=row["minute"])
+        for row in schedule
+    ]
+
+
+@app.put("/promo/schedule", response_model=PromoScheduleEntry)
+async def update_promo_schedule(entry: PromoScheduleUpdate):
+    if entry.slot not in PROMO_SLOTS:
+        raise HTTPException(status_code=400, detail="Unknown slot")
+    if entry.hour < 0 or entry.hour > 23 or entry.minute < 0 or entry.minute > 59:
+        raise HTTPException(status_code=400, detail="Invalid time")
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    async with db_lock:
+        await asyncio.to_thread(
+            _update_promo_schedule_entry_sync,
+            db_conn,
+            entry.slot,
+            entry.hour,
+            entry.minute,
+        )
+    _trigger_promo_scheduler_check()
+    return PromoScheduleEntry(slot=entry.slot, hour=entry.hour, minute=entry.minute)
+
+
+@app.get("/promo/status", response_model=PromoStatusResponse)
+async def promo_status(day: Optional[str] = None):
+    if db_conn is None:
+        raise HTTPException(status_code=500, detail="Database is not initialised.")
+    target_day = day or _build_day_key()
+    try:
+        datetime.fromisoformat(target_day)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid day format")
+
+    async with db_lock:
+        history_rows = await asyncio.to_thread(_fetch_promo_history_day_sync, db_conn, target_day)
+        schedule_rows = await asyncio.to_thread(_get_promo_schedule_sync, db_conn)
+        summary_rows = await asyncio.to_thread(_fetch_promo_group_summary_sync, db_conn, target_day)
+
+    slot_entries: Dict[str, List[PromoHistoryEntry]] = {}
+    for row in history_rows:
+        slot_entries.setdefault(row["slot"], []).append(
+            PromoHistoryEntry(
+                group_id=row["group_id"],
+                group_title=row.get("group_title"),
+                link=row["link"],
+                status=row["status"],
+                sent_at=row.get("sent_at"),
+                message_text=row.get("message_text"),
+                details=row.get("details"),
+            )
+        )
+
+    slots: List[PromoSlotStatus] = []
+    total_sent = 0
+    total_failed = 0
+
+    for row in schedule_rows:
+        slot = row["slot"]
+        entries = slot_entries.get(slot, [])
+        slots.append(
+            PromoSlotStatus(
+                slot=slot,
+                scheduled_for=f"{row['hour']:02d}:{row['minute']:02d}",
+                entries=entries,
+            )
+        )
+        total_sent += sum(1 for entry in entries if entry.status == "sent")
+        total_failed += sum(1 for entry in entries if entry.status != "sent")
+
+    group_summary = [
+        PromoGroupSummary(
+            group_id=row["group_id"],
+            title=row.get("title"),
+            link=row["link"],
+            sent=row.get("sent", 0),
+            failed=row.get("failed", 0),
+        )
+        for row in summary_rows
+    ]
+
+    return PromoStatusResponse(
+        day=target_day,
+        slots=slots,
+        group_summary=group_summary,
+        total_sent=total_sent,
+        total_failed=total_failed,
+    )
 
 
 @app.get("/scrape_exports", response_model=List[CSVExport])
