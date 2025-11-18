@@ -773,7 +773,7 @@ async def _sync_promo_groups_from_folder() -> None:
         return
 
     try:
-        filters = await client(functions.messages.GetDialogFiltersRequest())
+        filters_result = await client(functions.messages.GetDialogFiltersRequest())
     except RPCError as exc:
         logger.error("Не удалось получить папки диалогов: %s", exc)
         return
@@ -783,7 +783,8 @@ async def _sync_promo_groups_from_folder() -> None:
 
     folder_title_lower = PROMO_FOLDER_NAME.lower()
     target_filter = None
-    for dialog_filter in filters:
+    dialog_filters = getattr(filters_result, "filters", []) or []
+    for dialog_filter in dialog_filters:
         if getattr(dialog_filter, "title", "").lower() == folder_title_lower:
             target_filter = dialog_filter
             break
