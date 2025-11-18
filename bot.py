@@ -60,6 +60,8 @@ PROMO_MESSAGE_DELETE_PREFIX = "promo_message_del:"
 PROMO_SCHEDULE_CALLBACK = "promo_schedule"
 PROMO_SCHEDULE_EDIT_PREFIX = "promo_schedule_edit:"
 PROMO_STATUS_CALLBACK = "promo_status"
+PROMO_START_CALLBACK = "promo_start"
+PROMO_STOP_CALLBACK = "promo_stop"
 PROMO_CLOSE_CALLBACK = "promo_close"
 PROMO_SLOT_LABELS = {
     "morning": "Утро",
@@ -301,8 +303,10 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
 
     slots = data.get("slots", [])
     group_summary = data.get("group_summary", [])
+    is_paused = bool(data.get("is_paused"))
     lines = [
         f"Статус за {data.get('day')}:",
+        "Автоматическая рассылка: " + ("остановлена" if is_paused else "активна"),
         f"Отправлено: {data.get('total_sent', 0)}, с ошибкой: {data.get('total_failed', 0)}",
         "",
         "По группам:",
@@ -333,6 +337,11 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
     text = "\n".join(lines)
 
     keyboard = types.InlineKeyboardMarkup(row_width=1)
+    control_buttons = [
+        types.InlineKeyboardButton("▶️ Старт", callback_data=PROMO_START_CALLBACK),
+        types.InlineKeyboardButton("⏹ Стоп", callback_data=PROMO_STOP_CALLBACK),
+    ]
+    keyboard.row(*control_buttons)
     keyboard.add(types.InlineKeyboardButton("Обновить", callback_data=PROMO_STATUS_CALLBACK))
     keyboard.add(types.InlineKeyboardButton("⬅️ Назад", callback_data=PROMO_MENU_CALLBACK))
 
@@ -793,6 +802,40 @@ async def handle_promo_schedule_callback(callback_query: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == PROMO_STATUS_CALLBACK)
 async def handle_promo_status_callback(callback_query: types.CallbackQuery):
     await callback_query.answer()
+    await send_promo_status_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_START_CALLBACK)
+async def handle_promo_start_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer("Запускаю…")
+    try:
+        response, data = await api_json("post", "/promo/resume", timeout=20)
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось запустить рекламу: {exc}")
+        return
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка запуска ({response.status_code}): {response.text}"
+        )
+        return
+    await callback_query.message.answer("Рекламная рассылка запущена ✅")
+    await send_promo_status_view(callback_query.message, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == PROMO_STOP_CALLBACK)
+async def handle_promo_stop_callback(callback_query: types.CallbackQuery):
+    await callback_query.answer("Останавливаю…")
+    try:
+        response, data = await api_json("post", "/promo/pause", timeout=20)
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось остановить рекламу: {exc}")
+        return
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка остановки ({response.status_code}): {response.text}"
+        )
+        return
+    await callback_query.message.answer("Рекламная рассылка остановлена ⏹")
     await send_promo_status_view(callback_query.message, edit=True)
 
 

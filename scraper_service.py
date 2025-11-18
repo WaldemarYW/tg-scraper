@@ -75,6 +75,8 @@ promo_schedule_event = asyncio.Event()
 promo_slot_last_day: Dict[str, str] = {}
 promo_group_sync_lock = asyncio.Lock()
 promo_last_sync_ts: float = 0.0
+promo_paused: bool = False
+promo_control_lock = asyncio.Lock()
 
 os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
 
@@ -238,6 +240,7 @@ class PromoStatusResponse(BaseModel):
     group_summary: List[PromoGroupSummary]
     total_sent: int
     total_failed: int
+    is_paused: bool
 
 
 def _current_iso() -> str:
@@ -1061,6 +1064,9 @@ async def _record_promo_result(
 
 
 async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: str) -> bool:
+    if promo_paused:
+        logger.info("Promo slot %s skipped — scheduler paused", slot)
+        return False
     groups = await _get_active_promo_groups()
     if not groups:
         logger.info("Promo slot %s skipped — no groups configured", slot)
@@ -1909,6 +1915,23 @@ async def get_promo_groups():
     ]
 
 
+@app.post("/promo/pause")
+async def promo_pause():
+    global promo_paused
+    async with promo_control_lock:
+        promo_paused = True
+    return {"paused": True}
+
+
+@app.post("/promo/resume")
+async def promo_resume():
+    global promo_paused
+    async with promo_control_lock:
+        promo_paused = False
+    _trigger_promo_scheduler_check()
+    return {"paused": False}
+
+
 @app.get("/promo/messages", response_model=List[PromoMessageModel])
 async def get_promo_messages():
     if db_conn is None:
@@ -2052,6 +2075,7 @@ async def promo_status(day: Optional[str] = None):
         group_summary=group_summary,
         total_sent=total_sent,
         total_failed=total_failed,
+        is_paused=promo_paused,
     )
 
 
