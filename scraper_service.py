@@ -9,8 +9,10 @@ import re
 import sqlite3
 import uuid
 from datetime import datetime, timedelta, timezone, time
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
+
+import requests
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -58,6 +60,31 @@ PROMO_FOLDER_NAME = os.getenv("PROMO_FOLDER_NAME", "Бесплатно PR").stri
 PROMO_GROUP_SYNC_INTERVAL_SECONDS = int(os.getenv("PROMO_GROUP_SYNC_INTERVAL", 300))
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 UTC_TZ = timezone.utc
+CHAT_DIALOG_PAGE_SIZE = int(os.getenv("CHAT_DIALOG_PAGE_SIZE", 20))
+CHAT_MESSAGE_PAGE_SIZE = int(os.getenv("CHAT_MESSAGE_PAGE_SIZE", 20))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_DIALOG_MODEL = os.getenv("OPENAI_DIALOG_MODEL", "gpt-4o-mini-2024-07-18")
+DIALOG_AI_URL = os.getenv("DIALOG_AI_URL")
+HR_ASSISTANT_PROMPT = (
+    "Ты – віртуальний HR-асистент компанії Furioza, яка працює в сфері міжнародних онлайн-знайомств (дейтинг). "
+    "Твоє завдання – вести кандидатів по воронці від першого запиту до заповнення анкети. Працюй українською мовою, "
+    "пиши коротко, просто і по-людськи, ніби живий HR у Telegram. Дотримуйся наступного сценарію:\n\n"
+    "1. Загальні правила: відповідай стисло, по суті, без води; кілька коротких повідомлень краще довгих; тон доброзичливий, "
+    "але без сюсюкання; м’яко веди до наступного кроку (графік → навчання → анкета); якщо кандидат мовчить, "
+    "роби м’які фоллоу-апи.\n"
+    "2. Старт діалогу: привітайся, представся як Володимир HR Furioza, уточни, чи шукає роботу.\n"
+    "3. Міні-кваліфікація: запитай вік і чи є ноутбук/ПК; якщо немає техніки або <18 – ввічливо відмов.\n"
+    "4. Коротко поясни суть роботи оператора чату в сфері дейтингу.\n"
+    "5. Опиши графік (денна 14–23, нічна 23–08) і запитай, що зручно.\n"
+    "6. Поясни заробіток: перший місяць 450$+, далі 700–1000$+.\n"
+    "7. Розкажи про навчання (онлайн, ~2 години, блоки з тестами, після чого оплачуване стажування).\n"
+    "8. Запропонуй відео або пояснення в чаті; після відео попроси фідбек (+/-/питання).\n"
+    "9. Відповідай на стандартні питання (що таке дейтинг, штрафи, документи, цікаві листи, платформа).\n"
+    "10. Якщо кандидат готовий – попроси заповнити анкету з переліком даних (ПІБ, дата народження, телефон, посилання на Telegram, "
+    "чи є діти до 3 років, вибір зміни, старт стажування, місто, email, скрін документа).\n"
+    "11. Якщо замовк – роби ввічливі фоллоу-апи.\n"
+    "12. Будь-який вільний текст кандидата спробуй віднести до етапу воронки і відповідай відповідним блоком, ведучи до наступного кроку."
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("scraper")
@@ -246,6 +273,53 @@ class PromoStatusResponse(BaseModel):
     total_failed: int
     is_paused: bool
     current_slot: Optional[str] = None
+
+
+class DialogItem(BaseModel):
+    peer_id: int
+    name: str
+    username: Optional[str]
+    link: str
+    unread: bool
+    last_message: Optional[str]
+
+
+class DialogListResponse(BaseModel):
+    page: int
+    has_more: bool
+    items: List[DialogItem]
+
+
+class DialogMessage(BaseModel):
+    id: int
+    text: Optional[str]
+    is_outgoing: bool
+    date: Optional[str]
+    sender: Optional[str]
+
+
+class DialogMessagesResponse(BaseModel):
+    dialog: DialogItem
+    messages: List[DialogMessage]
+    next_offset: Optional[int]
+    has_more: bool
+
+
+class DialogSendRequest(BaseModel):
+    text: str
+
+
+class DialogSendResponse(BaseModel):
+    id: int
+    date: Optional[str]
+
+
+class DialogSuggestRequest(BaseModel):
+    draft: Optional[str] = None
+
+
+class DialogSuggestResponse(BaseModel):
+    suggestions: List[str]
 
 
 def _current_iso() -> str:
@@ -1066,6 +1140,230 @@ def _determine_current_slot(plan: List[Dict[str, Any]], *, now: Optional[datetim
         if now_local < start:
             return entry["slot"]
     return plan[0]["slot"]
+
+
+def _dialog_display_name(user: types.User) -> str:
+    first = user.first_name or ""
+    last = user.last_name or ""
+    name = f"{first} {last}".strip()
+    if name:
+        return name
+    if user.username:
+        return f"@{user.username}"
+    return f"id:{user.id}"
+
+
+def _dialog_link(user: types.User) -> str:
+    if user.username:
+        return f"https://t.me/{user.username}"
+    return f"tg://user?id={user.id}"
+
+
+def _truncate_preview(text: Optional[str], limit: int = 60) -> str:
+    if not text:
+        return ""
+    text = text.strip().replace("\n", " ")
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _dialog_to_dict(dialog: Any) -> Dict[str, Any]:
+    entity: types.User = dialog.entity
+    name = _dialog_display_name(entity)
+    username = entity.username
+    return {
+        "peer_id": entity.id,
+        "name": name,
+        "username": username,
+        "link": _dialog_link(entity),
+        "unread": bool(dialog.unread_count),
+        "last_message": _truncate_preview(getattr(dialog.message, "message", "") if dialog.message else ""),
+    }
+
+
+def _message_to_dict(message: Any) -> Dict[str, Any]:
+    text = message.message or ""
+    sender_display = "Я" if message.out else "Кандидат"
+    return {
+        "id": message.id,
+        "text": text,
+        "is_outgoing": bool(message.out),
+        "date": message.date.astimezone(KYIV_TZ).isoformat() if message.date else None,
+        "sender": sender_display,
+    }
+
+
+def _entity_to_dialog_item(entity: types.User) -> Dict[str, Any]:
+    return {
+        "peer_id": entity.id,
+        "name": _dialog_display_name(entity),
+        "username": entity.username,
+        "link": _dialog_link(entity),
+        "unread": False,
+        "last_message": None,
+    }
+
+
+async def _ensure_private_entity(peer_id: int) -> types.User:
+    entity = await client.get_entity(int(peer_id))
+    if not isinstance(entity, types.User) or entity.is_self or getattr(entity, "bot", False):
+        raise HTTPException(status_code=400, detail="Dialog is not a private user chat")
+    return entity
+
+
+async def _list_private_dialogs_page(page: int, page_size: int) -> Tuple[List[Dict[str, Any]], bool]:
+    if page < 0:
+        page = 0
+    start_index = page * page_size
+    end_index = start_index + page_size
+    target_count = end_index + 1
+    collected: List[Any] = []
+    async for dialog in client.iter_dialogs():
+        if not isinstance(dialog.entity, types.User):
+            continue
+        entity: types.User = dialog.entity
+        if entity.is_self or getattr(entity, "bot", False):
+            continue
+        collected.append(dialog)
+        if len(collected) >= target_count:
+            break
+    items = collected[start_index:end_index]
+    has_more = len(collected) > end_index
+    return [_dialog_to_dict(dialog) for dialog in items], has_more
+
+
+async def _fetch_dialog_messages(peer_id: int, limit: int, offset_id: Optional[int]) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+    entity = await _ensure_private_entity(peer_id)
+    messages: List[Dict[str, Any]] = []
+    next_offset = None
+    async for message in client.iter_messages(entity, limit=limit, offset_id=offset_id or 0):
+        messages.append(_message_to_dict(message))
+    if messages and len(messages) == limit:
+        next_offset = messages[-1]["id"]
+    return messages, next_offset
+
+
+async def _collect_recent_messages_for_context(peer_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+    entity = await _ensure_private_entity(peer_id)
+    collected: List[Dict[str, Any]] = []
+    async for message in client.iter_messages(entity, limit=limit):
+        collected.append(_message_to_dict(message))
+    collected.reverse()
+    return collected
+
+
+def _build_conversation_summary(messages: List[Dict[str, Any]]) -> str:
+    lines = []
+    for item in messages:
+        sender = item.get("sender") or ("Я" if item.get("is_outgoing") else "Кандидат")
+        text = item.get("text") or "[без тексту]"
+        text = text.strip()
+        if len(text) > 400:
+            text = text[:400] + "…"
+        lines.append(f"{sender}: {text}")
+    return "\n".join(lines)
+
+
+def _parse_gpt_suggestions(raw_text: str, limit: int = 3) -> List[str]:
+    suggestions: List[str] = []
+    for line in raw_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        match = re.match(r"^(\d+)[)\.-]\s*(.+)$", stripped)
+        if match:
+            suggestions.append(match.group(2).strip())
+        else:
+            suggestions.append(stripped)
+        if len(suggestions) >= limit:
+            break
+    if not suggestions and raw_text.strip():
+        suggestions = [raw_text.strip()]
+    return suggestions[:limit]
+
+
+async def _request_gpt_responses(prompt: str) -> str:
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    payload = {
+        "model": OPENAI_DIALOG_MODEL,
+        "input": [
+            {
+                "role": "system",
+                "content": "Ти — HR-асистент Furioza. Відповідай коротко та по сценарию."
+            },
+            {"role": "user", "content": prompt},
+        ],
+    }
+
+    def _post_request() -> Dict[str, Any]:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=60,
+        )
+        text = response.text
+        if not response.ok:
+            raise RuntimeError(f"OpenAI error {response.status_code}: {text[:200]}")
+        try:
+            data = response.json()
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"OpenAI returned invalid JSON: {text[:200]}") from exc
+        return data
+
+    data = await asyncio.to_thread(_post_request)
+    output = data.get("output") or []
+    if output and isinstance(output, list):
+        first = output[0]
+        content = first.get("content") if isinstance(first, dict) else None
+        if content and isinstance(content, list):
+            text_item = content[0]
+            if isinstance(text_item, dict):
+                text_value = text_item.get("text")
+                if text_value:
+                    return text_value
+    text_alt = data.get("output_text")
+    if text_alt:
+        return text_alt
+    raise RuntimeError("OpenAI response missing text content")
+
+
+async def _generate_dialog_suggestions(peer_id: int, draft: Optional[str]) -> List[str]:
+    recent_messages = await _collect_recent_messages_for_context(peer_id, limit=10)
+    summary = _build_conversation_summary(recent_messages)
+    history_payload = [
+        {
+            "sender": "me" if msg.get("is_outgoing") else "candidate",
+            "text": msg.get("text") or "",
+        }
+        for msg in recent_messages
+    ]
+    if DIALOG_AI_URL:
+        payload = {"history": history_payload, "draft": draft or ""}
+        def _post_dialog_server() -> Dict[str, Any]:
+            response = requests.post(DIALOG_AI_URL, json=payload, timeout=60)
+            if response.status_code != 200:
+                raise RuntimeError(f"Dialog AI server {response.status_code}: {response.text[:200]}")
+            return response.json()
+        data = await asyncio.to_thread(_post_dialog_server)
+        suggestions = data.get("suggestions") if isinstance(data, dict) else None
+        if suggestions and isinstance(suggestions, list):
+            return [str(item).strip() for item in suggestions if str(item).strip()]
+    prompt_parts = [HR_ASSISTANT_PROMPT, "", "Останні повідомлення (від старих до нових):", summary or "(історія пуста)"]
+    if draft:
+        prompt_parts.append("")
+        prompt_parts.append(f"Чернетка HR (можна переформулювати): {draft}")
+    prompt_parts.append("")
+    prompt_parts.append("Сформуй три можливі відповіді, дотримуйся формату 1) ..., 2) ..., 3) ...")
+    final_prompt = "\n".join(part for part in prompt_parts if part is not None)
+    raw_text = await _request_gpt_responses(final_prompt)
+    return _parse_gpt_suggestions(raw_text)
 
 
 def _trigger_promo_scheduler_check() -> None:
@@ -2016,6 +2314,53 @@ async def promo_resume():
         promo_paused = False
     _trigger_promo_scheduler_check()
     return {"paused": False}
+
+
+@app.get("/dialogs", response_model=DialogListResponse)
+async def api_list_dialogs(page: int = 0):
+    items, has_more = await _list_private_dialogs_page(page, CHAT_DIALOG_PAGE_SIZE)
+    return DialogListResponse(
+        page=page,
+        has_more=has_more,
+        items=[DialogItem(**item) for item in items],
+    )
+
+
+@app.get("/dialogs/{peer_id}/messages", response_model=DialogMessagesResponse)
+async def api_dialog_messages(peer_id: int, offset_id: Optional[int] = None):
+    entity = await _ensure_private_entity(peer_id)
+    messages, next_offset = await _fetch_dialog_messages(peer_id, CHAT_MESSAGE_PAGE_SIZE, offset_id)
+    dialog_item = _entity_to_dialog_item(entity)
+    return DialogMessagesResponse(
+        dialog=DialogItem(**dialog_item),
+        messages=[DialogMessage(**msg) for msg in messages],
+        next_offset=next_offset,
+        has_more=bool(next_offset),
+    )
+
+
+@app.post("/dialogs/{peer_id}/send", response_model=DialogSendResponse)
+async def api_dialog_send(peer_id: int, payload: DialogSendRequest):
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+    entity = await _ensure_private_entity(peer_id)
+    message = await client.send_message(entity, text)
+    date_iso = message.date.astimezone(KYIV_TZ).isoformat() if message.date else None
+    return DialogSendResponse(id=message.id, date=date_iso)
+
+
+@app.post("/dialogs/{peer_id}/suggest", response_model=DialogSuggestResponse)
+async def api_dialog_suggest(peer_id: int, payload: DialogSuggestRequest):
+    try:
+        await _ensure_private_entity(peer_id)
+        suggestions = await _generate_dialog_suggestions(peer_id, (payload.draft or "").strip() or None)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to generate suggestions: %s", exc)
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return DialogSuggestResponse(suggestions=suggestions)
 
 
 @app.get("/promo/messages", response_model=List[PromoMessageModel])

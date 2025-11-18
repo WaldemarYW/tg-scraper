@@ -27,6 +27,7 @@ dp = Dispatcher(bot)
 user_states: Dict[int, str] = {}  # user_id -> "waiting_for_chat"
 broadcast_states: Dict[int, Dict[str, Any]] = {}
 promo_states: Dict[int, Dict[str, Any]] = {}
+dialog_states: Dict[int, Dict[str, Any]] = {}
 
 
 async def api_request(method: str, endpoint: str, **kwargs):
@@ -76,6 +77,20 @@ PROMO_SLOT_EMOJI = {
     "noon": "🌤️",
     "evening": "🌙",
 }
+DIALOGS_MENU_COMMAND = "dialogs_menu"
+DIALOGS_PAGE_PREFIX = "dlgpage:"
+DIALOG_SELECT_PREFIX = "dlgsel:"
+DIALOG_REFRESH_PREFIX = "dlgref:"
+DIALOG_VIEW_REFRESH_PREFIX = "dlgview"
+DIALOG_MORE_PREFIX = "dlgmore:"
+DIALOG_BACK_CALLBACK = "dlgback"
+DIALOG_COMPOSE_CALLBACK = "dlgcompose"
+DIALOG_HELP_CALLBACK = "dlggpt"
+DIALOG_SEND_CONFIRM = "dlgsend"
+DIALOG_SEND_CANCEL = "dlgcancel"
+DIALOG_DRAFT_HELP = "dlghdraft"
+DIALOG_SUGGEST_PREFIX = "dlgsugg:"
+DIALOG_LIST_REFRESH = "dialogs_refresh"
 export_tokens: Dict[str, str] = {}
 current_scrape_job_id: Optional[str] = None
 
@@ -88,7 +103,7 @@ MAIN_KEYBOARD.row(
     types.KeyboardButton("Рассылка"),
     types.KeyboardButton("Статистика по дням"),
 )
-MAIN_KEYBOARD.row(types.KeyboardButton("Реклама"))
+MAIN_KEYBOARD.row(types.KeyboardButton("Реклама"), types.KeyboardButton("Диалоги"))
 
 SCRAPE_KEYBOARD = types.ReplyKeyboardMarkup(resize_keyboard=True)
 SCRAPE_KEYBOARD.row(types.KeyboardButton("/scrape"))
@@ -168,6 +183,12 @@ def _format_group_link(title: Optional[str], link: Optional[str]) -> str:
         if safe_link:
             return f'<a href="{safe_link}">{safe_display}</a>'
     return safe_display
+
+
+def _format_message_html(text: Optional[str]) -> str:
+    if not text:
+        return "<i>[без текста]</i>"
+    return html.escape(text).replace("\n", "<br>")
 
 
 async def _respond_with_markup(
@@ -476,6 +497,194 @@ async def send_promo_slots_view(target_message: types.Message, *, edit: bool = F
     keyboard.add(types.InlineKeyboardButton("Назад", callback_data=PROMO_STATUS_CALLBACK))
 
     await _respond_with_markup(target_message, text, keyboard, edit=edit, parse_mode="HTML")
+
+
+async def send_dialogs_list_message(
+    target_message: types.Message,
+    user_id: int,
+    page: int = 0,
+    *,
+    edit: bool = False,
+):
+    try:
+        response, data = await api_json("get", "/dialogs", params={"page": page}, timeout=20)
+    except Exception as exc:
+        await target_message.answer(f"Не удалось получить диалоги: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, dict):
+        await target_message.answer(
+            f"Ошибка списка диалогов ({response.status_code}): {response.text}"
+        )
+        return
+
+    items = data.get("items", [])
+    lines = [f"Диалоги (страница {page + 1}):"]
+    if not items:
+        lines.append("— нет личных переписок")
+    else:
+        for item in items:
+            name_link = _format_group_link(item.get("name"), item.get("link"))
+            username = item.get("username")
+            username_text = f" (@{username})" if username else ""
+            last_message = html.escape(item.get("last_message") or "")
+            prefix = "📩 " if item.get("unread") else ""
+            lines.append(f"{prefix}{name_link}{username_text}")
+            if last_message:
+                lines.append(f"<i>{last_message}</i>")
+            lines.append("")
+    text = "\n".join(lines).strip()
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for item in items:
+        label = ("📩 " if item.get("unread") else "") + (item.get("name") or "Без названия")
+        if item.get("username"):
+            label += f" (@{item['username']})"
+        callback_data = f"{DIALOG_SELECT_PREFIX}{item['peer_id']}:{page}"
+        keyboard.add(types.InlineKeyboardButton(label[:60], callback_data=callback_data))
+
+    nav_buttons = []
+    if page > 0:
+        nav_buttons.append(
+            types.InlineKeyboardButton("⬅️", callback_data=f"{DIALOGS_PAGE_PREFIX}{page - 1}")
+        )
+    if data.get("has_more"):
+        nav_buttons.append(
+            types.InlineKeyboardButton("➡️", callback_data=f"{DIALOGS_PAGE_PREFIX}{page + 1}")
+        )
+    if nav_buttons:
+        keyboard.row(*nav_buttons)
+
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "Обновить",
+            callback_data=f"{DIALOG_REFRESH_PREFIX}{page}",
+        )
+    )
+
+    dialog_state = dialog_states.get(user_id, {})
+    dialog_state.update({"mode": "list", "page": page})
+    dialog_states[user_id] = dialog_state
+
+    await _respond_with_markup(target_message, text, keyboard, edit=edit, parse_mode="HTML")
+
+
+async def send_dialog_view_message(
+    target_message: types.Message,
+    user_id: int,
+    peer_id: int,
+    *,
+    offset_id: Optional[int] = None,
+    edit: bool = False,
+    notice: Optional[str] = None,
+):
+    params = {"offset_id": offset_id} if offset_id else {}
+    try:
+        response, data = await api_json(
+            "get",
+            f"/dialogs/{peer_id}/messages",
+            params=params,
+            timeout=20,
+        )
+    except Exception as exc:
+        await target_message.answer(f"Не удалось получить сообщения: {exc}")
+        return
+
+    if response.status_code != 200 or not isinstance(data, dict):
+        await target_message.answer(
+            f"Ошибка сообщений ({response.status_code}): {response.text}"
+        )
+        return
+
+    dialog_info = data.get("dialog") or {}
+    dialog_name = dialog_info.get("name") or dialog_info.get("link")
+    header = _format_group_link(dialog_name, dialog_info.get("link"))
+    lines = [f"Диалог з {header}"]
+    if notice:
+        lines.extend(["", f"<b>{html.escape(notice)}</b>"])
+    lines.append("")
+    lines.append("Останні повідомлення:")
+
+    messages = data.get("messages", [])
+    if not messages:
+        lines.append("— історія пуста")
+    else:
+        for item in reversed(messages):
+            prefix = html.escape(item.get("sender") or ("Я" if item.get("is_outgoing") else "Кандидат"))
+            text_html = _format_message_html(item.get("text"))
+            lines.append(f"&gt; <b>{prefix}</b>: {text_html}")
+    text = "\n".join(lines)
+
+    keyboard = types.InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        types.InlineKeyboardButton("Отправить", callback_data=f"{DIALOG_COMPOSE_CALLBACK}:{peer_id}"),
+        types.InlineKeyboardButton("Помощь GPT", callback_data=f"{DIALOG_HELP_CALLBACK}:{peer_id}"),
+    )
+    keyboard.row(
+        types.InlineKeyboardButton("Обновить", callback_data=f"{DIALOG_VIEW_REFRESH_PREFIX}:{peer_id}"),
+        types.InlineKeyboardButton("⬅️ Назад", callback_data=DIALOG_BACK_CALLBACK),
+    )
+    if data.get("has_more") and data.get("next_offset"):
+        keyboard.add(
+            types.InlineKeyboardButton(
+                "Показать ранее",
+                callback_data=f"{DIALOG_MORE_PREFIX}{peer_id}:{data['next_offset']}",
+            )
+        )
+
+    state = dialog_states.get(user_id, {})
+    state.update(
+        {
+            "mode": "view",
+            "peer_id": peer_id,
+            "dialog_title": dialog_name,
+            "dialog_link": dialog_info.get("link"),
+            "page": state.get("page", 0),
+            "next_offset": data.get("next_offset"),
+            "draft": None,
+            "suggestions": [],
+        }
+    )
+    dialog_states[user_id] = state
+
+    await _respond_with_markup(target_message, text, keyboard, edit=edit, parse_mode="HTML")
+
+
+async def send_dialog_suggestions(user_id: int, peer_id: int, draft: Optional[str], reply_message: types.Message):
+    payload = {"draft": draft}
+    try:
+        response, data = await api_json("post", f"/dialogs/{peer_id}/suggest", json=payload, timeout=60)
+    except Exception as exc:
+        await reply_message.answer(f"Не удалось получить подсказки: {exc}")
+        return
+    if response.status_code != 200 or not isinstance(data, dict):
+        await reply_message.answer(
+            f"Ошибка подсказок ({response.status_code}): {response.text}"
+        )
+        return
+
+    suggestions = data.get("suggestions") or []
+    if not suggestions:
+        await reply_message.answer("GPT не вернул варианты.")
+        return
+
+    dialog_states.setdefault(user_id, {})["suggestions"] = suggestions
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for idx, suggestion in enumerate(suggestions):
+        label = _short_label(suggestion, 45)
+        keyboard.add(
+            types.InlineKeyboardButton(
+                label,
+                callback_data=f"{DIALOG_SUGGEST_PREFIX}{idx}:{peer_id}",
+            )
+        )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "Отмена",
+            callback_data=DIALOG_SEND_CANCEL,
+        )
+    )
+    await reply_message.answer("Варианты ответов:", reply_markup=keyboard)
 
 
 async def send_broadcast_stats_message(message: types.Message):
@@ -869,6 +1078,21 @@ async def handle_main_promo_menu(message: types.Message):
     await open_promo_menu(message)
 
 
+async def open_dialogs_menu(message: types.Message):
+    user_id = message.from_user.id
+    await send_dialogs_list_message(message, user_id, page=0, edit=False)
+
+
+@dp.message_handler(commands=["dialogs"])
+async def cmd_dialogs(message: types.Message):
+    await open_dialogs_menu(message)
+
+
+@dp.message_handler(lambda m: m.text == "Диалоги")
+async def handle_dialogs_button(message: types.Message):
+    await open_dialogs_menu(message)
+
+
 @dp.message_handler(lambda m: m.text == "Назад")
 async def handle_back_to_main(message: types.Message):
     promo_states.pop(message.from_user.id, None)
@@ -1030,13 +1254,228 @@ async def handle_promo_close_callback(callback_query: types.CallbackQuery):
     await callback_query.message.edit_text("Меню рекламы закрыто.")
 
 
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOGS_PAGE_PREFIX))
+async def handle_dialog_page(callback_query: types.CallbackQuery):
+    try:
+        page = int(callback_query.data[len(DIALOGS_PAGE_PREFIX) :])
+    except ValueError:
+        await callback_query.answer("Некорректная страница", show_alert=True)
+        return
+    await callback_query.answer()
+    await send_dialogs_list_message(callback_query.message, callback_query.from_user.id, page=page, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_REFRESH_PREFIX))
+async def handle_dialog_refresh(callback_query: types.CallbackQuery):
+    try:
+        page = int(callback_query.data[len(DIALOG_REFRESH_PREFIX) :])
+    except ValueError:
+        page = dialog_states.get(callback_query.from_user.id, {}).get("page", 0)
+    await callback_query.answer("Обновляю…")
+    await send_dialogs_list_message(callback_query.message, callback_query.from_user.id, page=page, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_SELECT_PREFIX))
+async def handle_dialog_select(callback_query: types.CallbackQuery):
+    payload = callback_query.data[len(DIALOG_SELECT_PREFIX) :]
+    try:
+        peer_id_str, page_str = payload.split(":", 1)
+        peer_id = int(peer_id_str)
+        page = int(page_str)
+    except ValueError:
+        await callback_query.answer("Некорректный выбор", show_alert=True)
+        return
+    state = dialog_states.get(callback_query.from_user.id, {})
+    state.update({"page": page})
+    dialog_states[callback_query.from_user.id] = state
+    await callback_query.answer()
+    await send_dialog_view_message(callback_query.message, callback_query.from_user.id, peer_id, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data == DIALOG_BACK_CALLBACK)
+async def handle_dialog_back(callback_query: types.CallbackQuery):
+    page = dialog_states.get(callback_query.from_user.id, {}).get("page", 0)
+    await callback_query.answer()
+    await send_dialogs_list_message(callback_query.message, callback_query.from_user.id, page=page, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_VIEW_REFRESH_PREFIX))
+async def handle_dialog_view_refresh(callback_query: types.CallbackQuery):
+    try:
+        peer_id = int(callback_query.data[len(DIALOG_VIEW_REFRESH_PREFIX) + 1 :])
+    except ValueError:
+        peer_id = dialog_states.get(callback_query.from_user.id, {}).get("peer_id")
+    if not peer_id:
+        await callback_query.answer("Диалог не выбран", show_alert=True)
+        return
+    await callback_query.answer("Обновляю…")
+    await send_dialog_view_message(callback_query.message, callback_query.from_user.id, peer_id, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_MORE_PREFIX))
+async def handle_dialog_more(callback_query: types.CallbackQuery):
+    payload = callback_query.data[len(DIALOG_MORE_PREFIX) :]
+    try:
+        peer_id_str, offset_str = payload.split(":", 1)
+        peer_id = int(peer_id_str)
+        offset = int(offset_str)
+    except ValueError:
+        await callback_query.answer("Некорректный запрос", show_alert=True)
+        return
+    await callback_query.answer()
+    await send_dialog_view_message(callback_query.message, callback_query.from_user.id, peer_id, offset_id=offset, edit=True)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_COMPOSE_CALLBACK))
+async def handle_dialog_compose(callback_query: types.CallbackQuery):
+    try:
+        peer_id = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        peer_id = dialog_states.get(callback_query.from_user.id, {}).get("peer_id")
+    if not peer_id:
+        await callback_query.answer("Диалог не выбран", show_alert=True)
+        return
+    state = dialog_states.get(callback_query.from_user.id, {})
+    state.update({"mode": "await_text", "peer_id": peer_id, "draft": None})
+    dialog_states[callback_query.from_user.id] = state
+    await callback_query.answer()
+    await callback_query.message.answer("Напиши сообщение для отправки. После ввода я предложу отправить или получить помощь GPT.")
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_HELP_CALLBACK))
+async def handle_dialog_help(callback_query: types.CallbackQuery):
+    try:
+        peer_id = int(callback_query.data.split(":", 1)[1])
+    except (ValueError, IndexError):
+        peer_id = dialog_states.get(callback_query.from_user.id, {}).get("peer_id")
+    if not peer_id:
+        await callback_query.answer("Диалог не выбран", show_alert=True)
+        return
+    draft = dialog_states.get(callback_query.from_user.id, {}).get("draft")
+    await callback_query.answer("Генерирую…")
+    await send_dialog_suggestions(callback_query.from_user.id, peer_id, draft, callback_query.message)
+
+
+@dp.callback_query_handler(lambda c: c.data == DIALOG_SEND_CANCEL)
+async def handle_dialog_cancel(callback_query: types.CallbackQuery):
+    state = dialog_states.get(callback_query.from_user.id, {})
+    if state.get("mode") == "await_text" or state.get("mode") == "draft_ready":
+        state["mode"] = "view"
+        state["draft"] = None
+    dialog_states[callback_query.from_user.id] = state
+    await callback_query.answer("Черновик очищен")
+
+
+@dp.callback_query_handler(lambda c: c.data == DIALOG_SEND_CONFIRM)
+async def handle_dialog_send_confirm(callback_query: types.CallbackQuery):
+    state = dialog_states.get(callback_query.from_user.id, {})
+    peer_id = state.get("peer_id")
+    draft = (state.get("draft") or "").strip()
+    if not peer_id or not draft:
+        await callback_query.answer("Нет сообщения", show_alert=True)
+        return
+    try:
+        response, data = await api_json(
+            "post",
+            f"/dialogs/{peer_id}/send",
+            json={"text": draft},
+            timeout=20,
+        )
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось отправить: {exc}")
+        return
+    if response.status_code != 200 or not isinstance(data, dict):
+        await callback_query.message.answer(
+            f"Ошибка отправки ({response.status_code}): {response.text}"
+        )
+        return
+    state["draft"] = None
+    state["mode"] = "view"
+    dialog_states[callback_query.from_user.id] = state
+    await callback_query.answer("Отправлено")
+    await send_dialog_view_message(callback_query.message, callback_query.from_user.id, peer_id, edit=True, notice="Сообщение отправлено")
+
+
+@dp.callback_query_handler(lambda c: c.data == DIALOG_DRAFT_HELP)
+async def handle_dialog_draft_help(callback_query: types.CallbackQuery):
+    state = dialog_states.get(callback_query.from_user.id, {})
+    peer_id = state.get("peer_id")
+    draft = (state.get("draft") or "").strip()
+    if not peer_id or not draft:
+        await callback_query.answer("Нет черновика", show_alert=True)
+        return
+    await callback_query.answer("Думаю…")
+    await send_dialog_suggestions(callback_query.from_user.id, peer_id, draft, callback_query.message)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_SUGGEST_PREFIX))
+async def handle_dialog_suggest_choice(callback_query: types.CallbackQuery):
+    payload = callback_query.data[len(DIALOG_SUGGEST_PREFIX) :]
+    try:
+        idx_str, peer_id_str = payload.split(":", 1)
+        idx = int(idx_str)
+        peer_id = int(peer_id_str)
+    except ValueError:
+        await callback_query.answer("Некорректный выбор", show_alert=True)
+        return
+    state = dialog_states.get(callback_query.from_user.id, {})
+    suggestions = state.get("suggestions") or []
+    if idx < 0 or idx >= len(suggestions):
+        await callback_query.answer("Нет такого варианта", show_alert=True)
+        return
+    text = suggestions[idx]
+    try:
+        response, data = await api_json(
+            "post",
+            f"/dialogs/{peer_id}/send",
+            json={"text": text},
+            timeout=20,
+        )
+    except Exception as exc:
+        await callback_query.message.answer(f"Не удалось отправить: {exc}")
+        return
+    if response.status_code != 200:
+        await callback_query.message.answer(
+            f"Ошибка отправки ({response.status_code}): {response.text}"
+        )
+        return
+    state["draft"] = None
+    state["mode"] = "view"
+    dialog_states[callback_query.from_user.id] = state
+    await callback_query.answer("Отправлено")
+    await send_dialog_view_message(callback_query.message, callback_query.from_user.id, peer_id, edit=True, notice="Вариант отправлен")
+
+
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def handle_text(message: types.Message):
     user_id = message.from_user.id
     state = user_states.get(user_id)
     broadcast_state = broadcast_states.get(user_id)
     promo_state = promo_states.get(user_id)
+    dialog_state = dialog_states.get(user_id)
     global current_scrape_job_id
+
+    if dialog_state and dialog_state.get("mode") in {"await_text", "draft_ready"}:
+        text_value = (message.text or "").strip()
+        if not text_value:
+            await message.answer("Текст не может быть пустым.")
+            return
+        dialog_state["draft"] = text_value
+        dialog_state["mode"] = "draft_ready"
+        dialog_states[user_id] = dialog_state
+        preview = _format_message_html(text_value)
+        keyboard = types.InlineKeyboardMarkup(row_width=2)
+        keyboard.row(
+            types.InlineKeyboardButton("Отправить", callback_data=DIALOG_SEND_CONFIRM),
+            types.InlineKeyboardButton("Помощь", callback_data=DIALOG_DRAFT_HELP),
+        )
+        keyboard.add(types.InlineKeyboardButton("Отмена", callback_data=DIALOG_SEND_CANCEL))
+        await message.answer(
+            f"Черновик:\n{preview}\n\nВыбери действие:",
+            reply_markup=keyboard,
+            parse_mode="HTML",
+        )
+        return
 
     if broadcast_state:
         step = broadcast_state.get("step")
