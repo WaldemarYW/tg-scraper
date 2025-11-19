@@ -664,9 +664,9 @@ async def send_dialog_suggestions(user_id: int, peer_id: int, draft: Optional[st
         return
 
     suggestions = data.get("suggestions") or []
-   if not suggestions:
-       await reply_message.answer("GPT не вернул варианты.")
-       return
+    if not suggestions:
+        await reply_message.answer("GPT не вернул варианты.")
+        return
 
     dialog_states.setdefault(user_id, {})["suggestions"] = suggestions
     keyboard = types.InlineKeyboardMarkup(row_width=3)
