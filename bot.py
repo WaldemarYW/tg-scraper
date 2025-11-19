@@ -90,6 +90,7 @@ DIALOG_SEND_CONFIRM = "dlgsend"
 DIALOG_SEND_CANCEL = "dlgcancel"
 DIALOG_DRAFT_HELP = "dlghdraft"
 DIALOG_SUGGEST_PREFIX = "dlgsugg:"
+DIALOG_SUGGEST_BACK = "dlgsback:"
 DIALOG_SUGGEST_REGENERATE_PREFIX = "dlgsreg:"
 DIALOG_LAST_SUGGESTIONS_PREFIX = "dlgslast:"
 DIALOG_LIST_REFRESH = "dialogs_refresh"
@@ -215,7 +216,12 @@ def _build_suggestions_keyboard(peer_id: int, count: int) -> types.InlineKeyboar
             callback_data=f"{DIALOG_SUGGEST_REGENERATE_PREFIX}{peer_id}",
         )
     )
-    keyboard.add(types.InlineKeyboardButton("Отмена", callback_data=DIALOG_SEND_CANCEL))
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "Назад",
+            callback_data=f"{DIALOG_SUGGEST_BACK}{peer_id}",
+        )
+    )
     return keyboard
 
 
@@ -1429,6 +1435,22 @@ async def handle_dialog_last_suggestions(callback_query: types.CallbackQuery):
         return
     await callback_query.answer()
     await send_saved_suggestions(callback_query.from_user.id, peer_id, callback_query.message)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_SUGGEST_BACK))
+async def handle_dialog_suggest_back(callback_query: types.CallbackQuery):
+    try:
+        peer_id = int(callback_query.data[len(DIALOG_SUGGEST_BACK) :])
+    except ValueError:
+        peer_id = dialog_states.get(callback_query.from_user.id, {}).get("peer_id")
+    if not peer_id:
+        await callback_query.answer("Диалог не выбран", show_alert=True)
+        return
+    await callback_query.answer("Назад")
+    try:
+        await callback_query.message.delete()
+    except MessageToDeleteNotFound:
+        pass
 
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_SUGGEST_REGENERATE_PREFIX))
