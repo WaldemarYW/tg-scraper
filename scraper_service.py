@@ -316,6 +316,7 @@ class DialogSendResponse(BaseModel):
 
 class DialogSuggestRequest(BaseModel):
     draft: Optional[str] = None
+    extra: Optional[str] = None
 
 
 class DialogSuggestResponse(BaseModel):
@@ -1334,7 +1335,7 @@ async def _request_gpt_responses(prompt: str) -> str:
     raise RuntimeError("OpenAI response missing text content")
 
 
-async def _generate_dialog_suggestions(peer_id: int, draft: Optional[str]) -> List[str]:
+async def _generate_dialog_suggestions(peer_id: int, draft: Optional[str], extra: Optional[str] = None) -> List[str]:
     recent_messages = await _collect_recent_messages_for_context(peer_id, limit=10)
     summary = _build_conversation_summary(recent_messages)
     history_payload = [
@@ -1346,6 +1347,8 @@ async def _generate_dialog_suggestions(peer_id: int, draft: Optional[str]) -> Li
     ]
     if DIALOG_AI_URL:
         payload = {"history": history_payload, "draft": draft or ""}
+        if extra:
+            payload["extra"] = extra
         def _post_dialog_server() -> Dict[str, Any]:
             response = requests.post(DIALOG_AI_URL, json=payload, timeout=60)
             if response.status_code != 200:
@@ -1359,6 +1362,9 @@ async def _generate_dialog_suggestions(peer_id: int, draft: Optional[str]) -> Li
     if draft:
         prompt_parts.append("")
         prompt_parts.append(f"Чернетка HR (можна переформулювати): {draft}")
+    if extra:
+        prompt_parts.append("")
+        prompt_parts.append(f"Додаткові побажання HR: {extra}")
     prompt_parts.append("")
     prompt_parts.append("Сформуй три можливі відповіді, дотримуйся формату 1) ..., 2) ..., 3) ...")
     final_prompt = "\n".join(part for part in prompt_parts if part is not None)
@@ -2354,7 +2360,11 @@ async def api_dialog_send(peer_id: int, payload: DialogSendRequest):
 async def api_dialog_suggest(peer_id: int, payload: DialogSuggestRequest):
     try:
         await _ensure_private_entity(peer_id)
-        suggestions = await _generate_dialog_suggestions(peer_id, (payload.draft or "").strip() or None)
+        suggestions = await _generate_dialog_suggestions(
+            peer_id,
+            (payload.draft or "").strip() or None,
+            (payload.extra or "").strip() or None,
+        )
     except HTTPException:
         raise
     except Exception as exc:

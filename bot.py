@@ -90,6 +90,8 @@ DIALOG_SEND_CONFIRM = "dlgsend"
 DIALOG_SEND_CANCEL = "dlgcancel"
 DIALOG_DRAFT_HELP = "dlghdraft"
 DIALOG_SUGGEST_PREFIX = "dlgsugg:"
+DIALOG_SUGGEST_REGENERATE_PREFIX = "dlgsreg:"
+DIALOG_LAST_SUGGESTIONS_PREFIX = "dlgslast:"
 DIALOG_LIST_REFRESH = "dialogs_refresh"
 export_tokens: Dict[str, str] = {}
 current_scrape_job_id: Optional[str] = None
@@ -189,6 +191,42 @@ def _format_message_html(text: Optional[str]) -> str:
     if not text:
         return "<i>[без текста]</i>"
     return html.escape(text)
+
+
+def _format_suggestions_text(suggestions: List[str]) -> str:
+    lines = ["Варианты ответов:"]
+    for idx, suggestion in enumerate(suggestions, 1):
+        lines.append(f"{idx}) {_format_message_html(suggestion)}")
+    return "\n".join(lines)
+
+
+def _build_suggestions_keyboard(peer_id: int, count: int) -> types.InlineKeyboardMarkup:
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    for idx in range(count):
+        keyboard.add(
+            types.InlineKeyboardButton(
+                f"Вариант {idx + 1}",
+                callback_data=f"{DIALOG_SUGGEST_PREFIX}{idx}:{peer_id}",
+            )
+        )
+    keyboard.add(
+        types.InlineKeyboardButton(
+            "🔄 Новая генерация",
+            callback_data=f"{DIALOG_SUGGEST_REGENERATE_PREFIX}{peer_id}",
+        )
+    )
+    keyboard.add(types.InlineKeyboardButton("Отмена", callback_data=DIALOG_SEND_CANCEL))
+    return keyboard
+
+
+async def _send_suggestions_reply(
+    target_message: types.Message,
+    peer_id: int,
+    suggestions: List[str],
+) -> None:
+    text = _format_suggestions_text(suggestions)
+    keyboard = _build_suggestions_keyboard(peer_id, len(suggestions))
+    await target_message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def _respond_with_markup(
@@ -615,6 +653,11 @@ async def send_dialog_view_message(
             lines.append(f"&gt; <b>{prefix}</b>: {text_html}")
     text = "\n".join(lines)
 
+    state = dialog_states.get(user_id, {})
+    preserved_suggestions: List[str] = []
+    if state.get("suggestions_peer_id") == peer_id:
+        preserved_suggestions = state.get("suggestions") or []
+
     keyboard = types.InlineKeyboardMarkup(row_width=2)
     keyboard.row(
         types.InlineKeyboardButton("Отправить", callback_data=f"{DIALOG_COMPOSE_CALLBACK}:{peer_id}"),
@@ -624,6 +667,13 @@ async def send_dialog_view_message(
         types.InlineKeyboardButton("Обновить", callback_data=f"{DIALOG_VIEW_REFRESH_PREFIX}:{peer_id}"),
         types.InlineKeyboardButton("⬅️ Назад", callback_data=DIALOG_BACK_CALLBACK),
     )
+    if preserved_suggestions:
+        keyboard.add(
+            types.InlineKeyboardButton(
+                "Последние варианты",
+                callback_data=f"{DIALOG_LAST_SUGGESTIONS_PREFIX}{peer_id}",
+            )
+        )
     if data.get("has_more") and data.get("next_offset"):
         keyboard.add(
             types.InlineKeyboardButton(
@@ -632,7 +682,8 @@ async def send_dialog_view_message(
             )
         )
 
-    state = dialog_states.get(user_id, {})
+    if state.get("suggestions_peer_id") != peer_id:
+        preserved_suggestions = []
     state.update(
         {
             "mode": "view",
@@ -642,7 +693,8 @@ async def send_dialog_view_message(
             "page": state.get("page", 0),
             "next_offset": data.get("next_offset"),
             "draft": None,
-            "suggestions": [],
+            "suggestions": preserved_suggestions,
+            "suggestions_peer_id": peer_id if preserved_suggestions else None,
         }
     )
     dialog_states[user_id] = state
@@ -650,8 +702,16 @@ async def send_dialog_view_message(
     await _respond_with_markup(target_message, text, keyboard, edit=edit, parse_mode="HTML")
 
 
-async def send_dialog_suggestions(user_id: int, peer_id: int, draft: Optional[str], reply_message: types.Message):
-    payload = {"draft": draft}
+async def send_dialog_suggestions(
+    user_id: int,
+    peer_id: int,
+    draft: Optional[str],
+    reply_message: types.Message,
+    extra_prompt: Optional[str] = None,
+):
+    payload: Dict[str, Any] = {"draft": draft}
+    if extra_prompt:
+        payload["extra"] = extra_prompt
     try:
         response, data = await api_json("post", f"/dialogs/{peer_id}/suggest", json=payload, timeout=60)
     except Exception as exc:
@@ -668,27 +728,25 @@ async def send_dialog_suggestions(user_id: int, peer_id: int, draft: Optional[st
         await reply_message.answer("GPT не вернул варианты.")
         return
 
-    dialog_states.setdefault(user_id, {})["suggestions"] = suggestions
-    keyboard = types.InlineKeyboardMarkup(row_width=3)
-    for idx, _ in enumerate(suggestions):
-        label = f"Вариант {idx + 1}"
-        keyboard.add(
-            types.InlineKeyboardButton(
-                label,
-                callback_data=f"{DIALOG_SUGGEST_PREFIX}{idx}:{peer_id}",
-            )
-        )
-    keyboard.add(
-        types.InlineKeyboardButton(
-            "Отмена",
-            callback_data=DIALOG_SEND_CANCEL,
-        )
-    )
-    lines = ["Варианты ответов:"]
-    for idx, suggestion in enumerate(suggestions, 1):
-        lines.append(f"{idx}) {_format_message_html(suggestion)}")
-    text = "\n".join(lines)
-    await reply_message.answer(text, reply_markup=keyboard, parse_mode="HTML")
+    state = dialog_states.setdefault(user_id, {})
+    state["suggestions"] = suggestions
+    state["suggestions_peer_id"] = peer_id
+    state["last_suggestion_draft"] = draft
+    state["last_suggestion_extra"] = extra_prompt
+    state["awaiting_hint"] = False
+    state["hint_peer_id"] = None
+    dialog_states[user_id] = state
+
+    await _send_suggestions_reply(reply_message, peer_id, suggestions)
+
+
+async def send_saved_suggestions(user_id: int, peer_id: int, reply_message: types.Message):
+    state = dialog_states.get(user_id, {})
+    suggestions = state.get("suggestions") or []
+    if not suggestions or state.get("suggestions_peer_id") != peer_id:
+        await reply_message.answer("Нет сохранённых вариантов.")
+        return
+    await _send_suggestions_reply(reply_message, peer_id, suggestions)
 
 
 async def send_broadcast_stats_message(message: types.Message):
@@ -1360,12 +1418,47 @@ async def handle_dialog_help(callback_query: types.CallbackQuery):
     await send_dialog_suggestions(callback_query.from_user.id, peer_id, draft, callback_query.message)
 
 
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_LAST_SUGGESTIONS_PREFIX))
+async def handle_dialog_last_suggestions(callback_query: types.CallbackQuery):
+    try:
+        peer_id = int(callback_query.data[len(DIALOG_LAST_SUGGESTIONS_PREFIX) :])
+    except ValueError:
+        peer_id = dialog_states.get(callback_query.from_user.id, {}).get("peer_id")
+    if not peer_id:
+        await callback_query.answer("Диалог не выбран", show_alert=True)
+        return
+    await callback_query.answer()
+    await send_saved_suggestions(callback_query.from_user.id, peer_id, callback_query.message)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith(DIALOG_SUGGEST_REGENERATE_PREFIX))
+async def handle_dialog_suggest_regenerate(callback_query: types.CallbackQuery):
+    try:
+        peer_id = int(callback_query.data[len(DIALOG_SUGGEST_REGENERATE_PREFIX) :])
+    except ValueError:
+        peer_id = dialog_states.get(callback_query.from_user.id, {}).get("peer_id")
+    if not peer_id:
+        await callback_query.answer("Диалог не выбран", show_alert=True)
+        return
+    state = dialog_states.setdefault(callback_query.from_user.id, {})
+    state["awaiting_hint"] = True
+    state["hint_peer_id"] = peer_id
+    if "last_suggestion_draft" not in state:
+        state["last_suggestion_draft"] = state.get("draft")
+    dialog_states[callback_query.from_user.id] = state
+    await callback_query.answer()
+    await callback_query.message.answer("Что добавить к запросу для новой генерации? Отправь текст одним сообщением.")
+
+
 @dp.callback_query_handler(lambda c: c.data == DIALOG_SEND_CANCEL)
 async def handle_dialog_cancel(callback_query: types.CallbackQuery):
     state = dialog_states.get(callback_query.from_user.id, {})
     if state.get("mode") == "await_text" or state.get("mode") == "draft_ready":
         state["mode"] = "view"
         state["draft"] = None
+    if state.get("awaiting_hint"):
+        state["awaiting_hint"] = False
+        state["hint_peer_id"] = None
     dialog_states[callback_query.from_user.id] = state
     await callback_query.answer("Черновик очищен")
 
@@ -1479,6 +1572,27 @@ async def handle_text(message: types.Message):
             reply_markup=keyboard,
             parse_mode="HTML",
         )
+        return
+    elif dialog_state and dialog_state.get("awaiting_hint"):
+        hint_value = (message.text or "").strip()
+        if not hint_value:
+            await message.answer("Текст не может быть пустым.")
+            return
+        peer_id = dialog_state.get("hint_peer_id") or dialog_state.get("peer_id")
+        if not peer_id:
+            dialog_state["awaiting_hint"] = False
+            dialog_state["hint_peer_id"] = None
+            dialog_states[user_id] = dialog_state
+            await message.answer("Диалог не выбран.")
+            return
+        base_draft = dialog_state.get("last_suggestion_draft")
+        if base_draft is None:
+            base_draft = dialog_state.get("draft")
+        dialog_state["awaiting_hint"] = False
+        dialog_state["hint_peer_id"] = None
+        dialog_states[user_id] = dialog_state
+        await message.answer("Генерирую новые варианты…")
+        await send_dialog_suggestions(user_id, peer_id, base_draft, message, extra_prompt=hint_value)
         return
 
     if broadcast_state:
