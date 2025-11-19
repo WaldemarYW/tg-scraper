@@ -188,7 +188,7 @@ def _format_group_link(title: Optional[str], link: Optional[str]) -> str:
 def _format_message_html(text: Optional[str]) -> str:
     if not text:
         return "<i>[без текста]</i>"
-    return html.escape(text).replace("\n", "<br>")
+    return html.escape(text)
 
 
 async def _respond_with_markup(
