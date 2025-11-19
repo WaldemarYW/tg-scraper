@@ -664,14 +664,14 @@ async def send_dialog_suggestions(user_id: int, peer_id: int, draft: Optional[st
         return
 
     suggestions = data.get("suggestions") or []
-    if not suggestions:
-        await reply_message.answer("GPT не вернул варианты.")
-        return
+   if not suggestions:
+       await reply_message.answer("GPT не вернул варианты.")
+       return
 
     dialog_states.setdefault(user_id, {})["suggestions"] = suggestions
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
-    for idx, suggestion in enumerate(suggestions):
-        label = _short_label(suggestion, 45)
+    keyboard = types.InlineKeyboardMarkup(row_width=3)
+    for idx, _ in enumerate(suggestions):
+        label = f"Вариант {idx + 1}"
         keyboard.add(
             types.InlineKeyboardButton(
                 label,
@@ -684,7 +684,11 @@ async def send_dialog_suggestions(user_id: int, peer_id: int, draft: Optional[st
             callback_data=DIALOG_SEND_CANCEL,
         )
     )
-    await reply_message.answer("Варианты ответов:", reply_markup=keyboard)
+    lines = ["Варианты ответов:"]
+    for idx, suggestion in enumerate(suggestions, 1):
+        lines.append(f"{idx}) {_format_message_html(suggestion)}")
+    text = "\n".join(lines)
+    await reply_message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
 
 async def send_broadcast_stats_message(message: types.Message):
