@@ -431,6 +431,11 @@ async def send_promo_status_view(target_message: types.Message, *, edit: bool = 
                     slot_lines.append(f"   Отправлено сообщение #{msg_label}.")
                 else:
                     slot_lines.append(f"   Попытка сообщения #{msg_label}.")
+                if entry.get("is_deleted"):
+                    deleted_time = entry.get("delete_checked_at") or "—"
+                    slot_lines.append(
+                        f"   🚫 Сообщение удалено ботом (обнаружено в {_safe_text(deleted_time)})"
+                    )
                 details = entry.get("details")
                 if details and status != "sent":
                     slot_lines.append(f"   Детали: {_safe_text(details)}")
@@ -531,6 +536,11 @@ async def send_promo_slots_view(target_message: types.Message, *, edit: bool = F
                 lines.append(f"   Отправлено сообщение #{msg_label}.")
             else:
                 lines.append(f"   Попытка сообщения #{msg_label}.")
+            if entry.get("is_deleted"):
+                deleted_time = entry.get("delete_checked_at") or "—"
+                lines.append(
+                    f"   🚫 Сообщение удалено ботом (обнаружено в {_safe_text(deleted_time)})"
+                )
             details = entry.get("details")
             if details and status != "sent":
                 lines.append(f"   Детали: {_safe_text(details)}")

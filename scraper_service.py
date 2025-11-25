@@ -56,6 +56,9 @@ if PROMO_MIN_DELAY_SECONDS < 0:
     PROMO_MIN_DELAY_SECONDS = 0.0
 if PROMO_MAX_DELAY_SECONDS < PROMO_MIN_DELAY_SECONDS:
     PROMO_MAX_DELAY_SECONDS = PROMO_MIN_DELAY_SECONDS + 1.0
+PROMO_DELETE_CHECK_DELAY = float(os.getenv("PROMO_DELETE_CHECK_DELAY", 5))
+if PROMO_DELETE_CHECK_DELAY < 0:
+    PROMO_DELETE_CHECK_DELAY = 0.0
 PROMO_FOLDER_NAME = os.getenv("PROMO_FOLDER_NAME", "Бесплатно PR").strip()
 PROMO_GROUP_SYNC_INTERVAL_SECONDS = int(os.getenv("PROMO_GROUP_SYNC_INTERVAL", 300))
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -249,6 +252,9 @@ class PromoHistoryEntry(BaseModel):
     message_id: Optional[int]
     message_text: Optional[str]
     details: Optional[str]
+    telegram_message_id: Optional[int]
+    delete_checked_at: Optional[str]
+    is_deleted: bool = False
 
 
 class PromoSlotStatus(BaseModel):
@@ -443,6 +449,9 @@ def _ensure_promo_tables(conn: sqlite3.Connection) -> None:
             sent_at TEXT,
             status TEXT NOT NULL,
             details TEXT,
+            telegram_message_id INTEGER,
+            delete_checked_at TEXT,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY(group_id) REFERENCES promo_groups(id),
             FOREIGN KEY(message_id) REFERENCES promo_messages(id)
         )
@@ -470,6 +479,14 @@ def _ensure_promo_tables(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE promo_groups ADD COLUMN access_hash INTEGER")
     if "username" not in columns:
         conn.execute("ALTER TABLE promo_groups ADD COLUMN username TEXT")
+    cursor = conn.execute("PRAGMA table_info(promo_history)")
+    history_columns = {row[1] for row in cursor.fetchall()}
+    if "telegram_message_id" not in history_columns:
+        conn.execute("ALTER TABLE promo_history ADD COLUMN telegram_message_id INTEGER")
+    if "delete_checked_at" not in history_columns:
+        conn.execute("ALTER TABLE promo_history ADD COLUMN delete_checked_at TEXT")
+    if "is_deleted" not in history_columns:
+        conn.execute("ALTER TABLE promo_history ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
     conn.execute(
         """
         CREATE UNIQUE INDEX IF NOT EXISTS idx_promo_groups_peer
@@ -983,11 +1000,29 @@ def _record_promo_history_sync(
     sent_at: Optional[str],
     status: str,
     details: Optional[str],
+    telegram_message_id: Optional[int],
+    delete_checked_at: Optional[str],
+    is_deleted: bool,
 ) -> None:
     conn.execute(
         """
-        INSERT INTO promo_history(day_key, slot, group_id, group_title, link, message_id, message_text, planned_at, sent_at, status, details)
-        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO promo_history(
+            day_key,
+            slot,
+            group_id,
+            group_title,
+            link,
+            message_id,
+            message_text,
+            planned_at,
+            sent_at,
+            status,
+            details,
+            telegram_message_id,
+            delete_checked_at,
+            is_deleted
+        )
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             day_key,
@@ -1001,6 +1036,9 @@ def _record_promo_history_sync(
             sent_at,
             status,
             details,
+            telegram_message_id,
+            delete_checked_at,
+            1 if is_deleted else 0,
         ),
     )
     conn.commit()
@@ -1026,7 +1064,7 @@ def _update_group_send_stats_sync(
 def _fetch_promo_history_day_sync(conn: sqlite3.Connection, day_key: str) -> List[Dict[str, Any]]:
     cursor = conn.execute(
         """
-        SELECT day_key, slot, group_id, group_title, link, message_id, message_text, sent_at, status, details
+        SELECT day_key, slot, group_id, group_title, link, message_id, message_text, sent_at, status, details, telegram_message_id, delete_checked_at, is_deleted
         FROM promo_history
         WHERE day_key = ?
         ORDER BY id ASC
@@ -1045,6 +1083,9 @@ def _fetch_promo_history_day_sync(conn: sqlite3.Connection, day_key: str) -> Lis
             "sent_at": row[7],
             "status": row[8],
             "details": row[9],
+            "telegram_message_id": row[10],
+            "delete_checked_at": row[11],
+            "is_deleted": bool(row[12]),
         }
         for row in rows
     ]
@@ -1420,6 +1461,9 @@ async def _record_promo_result(
     sent_at: Optional[str],
     status: str,
     details: Optional[str],
+    telegram_message_id: Optional[int],
+    delete_checked_at: Optional[str],
+    is_deleted: bool,
 ) -> None:
     if db_conn is None:
         return
@@ -1435,6 +1479,9 @@ async def _record_promo_result(
             sent_at=sent_at,
             status=status,
             details=details,
+            telegram_message_id=telegram_message_id,
+            delete_checked_at=delete_checked_at,
+            is_deleted=is_deleted,
         )
         await asyncio.to_thread(
             _update_group_send_stats_sync,
@@ -1443,6 +1490,20 @@ async def _record_promo_result(
             sent_at,
             status,
         )
+
+
+async def _check_message_deleted(peer: Optional[Any], message_id: Optional[int]) -> Tuple[bool, Optional[str]]:
+    if peer is None or not message_id:
+        return False, None
+    try:
+        message = await client.get_messages(peer, ids=message_id)
+    except RPCError as exc:
+        logger.warning("Failed to verify promo message %s deletion: %s", message_id, exc)
+        return False, f"delete_check_error:{exc.__class__.__name__}"
+    except Exception as exc:
+        logger.exception("Unexpected error while verifying promo message %s deletion", message_id)
+        return False, f"delete_check_error:{exc}"
+    return message is None, None
 
 
 async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: str) -> bool:
@@ -1481,6 +1542,9 @@ async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: st
         status = "sent"
         details = None
         sent_at = None
+        telegram_message_id: Optional[int] = None
+        delete_checked_at: Optional[str] = None
+        is_deleted = False
         target_peer = _group_to_input_peer(group)
         display_name = _group_display_name(group)
         if target_peer is None:
@@ -1489,9 +1553,10 @@ async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: st
             logger.warning("Promo group %s не имеет корректного peer_id", display_name)
         else:
             try:
-                await client.send_message(target_peer, message["text"])
+                sent_message = await client.send_message(target_peer, message["text"])
                 sent_at = _current_iso()
                 status = "sent"
+                telegram_message_id = getattr(sent_message, "id", None)
                 logger.info("Promo message sent to %s", display_name)
             except FloodWaitError as exc:
                 wait_seconds = int(getattr(exc, "seconds", 30))
@@ -1512,6 +1577,17 @@ async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: st
                 details = f"error:{exc}"
                 logger.exception("Unexpected error sending promo to %s", display_name)
 
+        if status == "sent" and telegram_message_id and target_peer is not None:
+            if PROMO_DELETE_CHECK_DELAY > 0:
+                await asyncio.sleep(PROMO_DELETE_CHECK_DELAY)
+            deleted, check_error = await _check_message_deleted(target_peer, telegram_message_id)
+            delete_checked_at = _current_iso()
+            if deleted:
+                is_deleted = True
+                logger.info("Promo message %s in %s was removed shortly after sending", telegram_message_id, display_name)
+            if check_error and not details:
+                details = check_error
+
         await _record_promo_result(
             day_key=day_key,
             slot=slot,
@@ -1521,6 +1597,9 @@ async def _run_promo_slot(slot: str, schedule_entry: Dict[str, int], day_key: st
             sent_at=sent_at,
             status=status,
             details=details,
+            telegram_message_id=telegram_message_id,
+            delete_checked_at=delete_checked_at,
+            is_deleted=is_deleted,
         )
 
         if idx < len(pending_groups) - 1:
@@ -2480,6 +2559,9 @@ async def promo_status(day: Optional[str] = None):
                 message_id=row.get("message_id"),
                 message_text=row.get("message_text"),
                 details=row.get("details"),
+                telegram_message_id=row.get("telegram_message_id"),
+                delete_checked_at=_iso_to_kyiv_str(row.get("delete_checked_at")),
+                is_deleted=row.get("is_deleted", False),
             )
         )
 
