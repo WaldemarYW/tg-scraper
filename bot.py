@@ -1627,45 +1627,6 @@ async def handle_text(message: types.Message):
         await send_dialog_suggestions(user_id, peer_id, base_draft, message, extra_prompt=hint_value)
         return
 
-    if broadcast_state:
-        step = broadcast_state.get("step")
-        if step == "waiting_chat":
-            await message.answer("Сначала выбери чат из списка выше.", reply_markup=MAIN_KEYBOARD)
-            return
-        if step == "waiting_text":
-            broadcast_state["text"] = message.text
-            broadcast_state["step"] = "waiting_limit"
-            await message.answer("Сколько пользователей обработать? Введите число или `all`.", parse_mode="Markdown")
-            return
-        if step == "waiting_limit":
-            limit_text = message.text.strip().lower()
-            if limit_text in ("all", "все"):
-                broadcast_state["limit"] = None
-            else:
-                try:
-                    limit_value = int(limit_text)
-                    if limit_value <= 0:
-                        raise ValueError
-                    broadcast_state["limit"] = limit_value
-                except ValueError:
-                    await message.answer("Нужно указать положительное число или `all`.", parse_mode="Markdown")
-                    return
-            broadcast_state["step"] = "waiting_interval"
-            await message.answer("Введите интервал между сообщениями в секундах (можно 0).")
-            return
-        if step == "waiting_interval":
-            try:
-                interval_value = float(message.text.strip().replace(",", "."))
-                if interval_value < 0:
-                    raise ValueError
-            except ValueError:
-                await message.answer("Интервал должен быть числом 0 или больше.")
-                return
-            broadcast_state["interval"] = interval_value
-            await start_broadcast(message, user_id, broadcast_state)
-            broadcast_states.pop(user_id, None)
-            return
-
     if promo_state:
         text_value = (message.text or "").strip()
         lowered = text_value.lower()
@@ -1715,6 +1676,45 @@ async def handle_text(message: types.Message):
             label = PROMO_SLOT_LABELS.get(slot, slot)
             await message.answer(f"{label} обновлено на {hour:02d}:{minute:02d} ✅")
             await send_promo_schedule_view(message)
+            return
+
+    if broadcast_state:
+        step = broadcast_state.get("step")
+        if step == "waiting_chat":
+            await message.answer("Сначала выбери чат из списка выше.", reply_markup=MAIN_KEYBOARD)
+            return
+        if step == "waiting_text":
+            broadcast_state["text"] = message.text
+            broadcast_state["step"] = "waiting_limit"
+            await message.answer("Сколько пользователей обработать? Введите число или `all`.", parse_mode="Markdown")
+            return
+        if step == "waiting_limit":
+            limit_text = message.text.strip().lower()
+            if limit_text in ("all", "все"):
+                broadcast_state["limit"] = None
+            else:
+                try:
+                    limit_value = int(limit_text)
+                    if limit_value <= 0:
+                        raise ValueError
+                    broadcast_state["limit"] = limit_value
+                except ValueError:
+                    await message.answer("Нужно указать положительное число или `all`.", parse_mode="Markdown")
+                    return
+            broadcast_state["step"] = "waiting_interval"
+            await message.answer("Введите интервал между сообщениями в секундах (можно 0).")
+            return
+        if step == "waiting_interval":
+            try:
+                interval_value = float(message.text.strip().replace(",", "."))
+                if interval_value < 0:
+                    raise ValueError
+            except ValueError:
+                await message.answer("Интервал должен быть числом 0 или больше.")
+                return
+            broadcast_state["interval"] = interval_value
+            await start_broadcast(message, user_id, broadcast_state)
+            broadcast_states.pop(user_id, None)
             return
 
     # если мы ждем от этого юзера ссылку для скрапа
